@@ -1,0 +1,40 @@
+[project]
+name = "agent-container"
+version = "0"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = ["pytest", "mypy", "ruff", "ty"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+extend-include = ["agent"]
+target-version = "py312"
+line-length = 140
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort
+    "B",           # flake8-bugbear
+    "UP",          # pyupgrade
+    "SIM",         # flake8-simplify
+    "C4",          # flake8-comprehensions
+    "PIE",         # flake8-pie
+    "PERF",        # perflint
+    "PTH",         # flake8-use-pathlib
+    "RET",         # flake8-return
+    "TID",         # flake8-tidy-imports
+    "RUF",         # ruff-specific
+]
+ignore = [
+    "PERF401",     # manual-list-comprehension: stylistic, often less readable
+    "RUF001",      # ambiguous-unicode-character: TUI pointer char `❯` is intentional
+    "SIM108",      # ternary-operator: nested ternaries hurt readability
+]
+
+[tool.ty.src]
+include = ["agent", "tests", "scripts"]

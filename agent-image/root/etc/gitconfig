@@ -1,0 +1,6 @@
+[core]
+	excludesFile = /etc/gitignore
+[credential]
+	helper = cache
+[init]
+	defaultBranch = main

@@ -1,0 +1,1146 @@
+#!/usr/bin/env python3
+
+import contextlib
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, NoReturn, TextIO
+
+SharedHostPath = str | dict[str, str]
+
+NIX_IMAGE = "docker.io/nixos/nix:latest"
+NIX_BUILD_CACHE_VOLUME = "agent-nix-store"
+RUNTIME_NIX_VOLUME_PREFIX = "agent-container-nix-"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "container_engine": "docker",
+    "mount_mode": "repo_root",
+    "shared_host_paths": [],
+}
+
+CONTAINER_ENGINES = ("docker", "podman")
+
+SHARED_HOST_PATHS_ALLOWLIST: list[tuple[str, str, str]] = [
+    ("~/.claude/CLAUDE.md", "/home/agent/.claude/CLAUDE.md", "global Claude instructions"),
+    ("~/.claude/skills/", "/home/agent/.claude/skills/", "custom skills"),
+    ("~/.claude/agents/", "/home/agent/.claude/agents/", "custom subagents"),
+    ("~/.claude/commands/", "/home/agent/.claude/commands/", "custom slash commands"),
+    ("~/.agents/", "/home/agent/.agents/", "shared agent data"),
+    ("~/.config/gh/", "/home/agent/.config/gh/", "GitHub CLI auth"),
+    ("~/.gitconfig", "/home/agent/.gitconfig", "git user config"),
+    ("~/.config/git/", "/home/agent/.config/git/", "git XDG config"),
+]
+
+
+def _shared_host_entry_host(entry: SharedHostPath) -> str | None:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        host = entry.get("host")
+        return host if isinstance(host, str) else None
+    return None
+
+
+def _shared_host_entry_container(entry: SharedHostPath) -> str | None:
+    if isinstance(entry, dict):
+        container = entry.get("container")
+        return container if isinstance(container, str) else None
+    return None
+
+
+def _color_for(stream: TextIO) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return stream.isatty()
+
+
+_OUT_COLOR = _color_for(sys.stdout)
+_ERR_COLOR = _color_for(sys.stderr)
+
+
+def _sty(code: str, text: str, *, err: bool = False) -> str:
+    enabled = _ERR_COLOR if err else _OUT_COLOR
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+
+def _bold(s: str) -> str:
+    return _sty("1", s)
+
+
+_KEY_UP = "up"
+_KEY_DOWN = "down"
+_KEY_SPACE = "space"
+_KEY_ENTER = "enter"
+_KEY_CANCEL = "cancel"
+_KEY_OTHER = "other"
+
+
+def _tty_required() -> None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("setup requires an interactive terminal (stdin/stdout must be a TTY)")
+
+
+@contextlib.contextmanager
+def _raw_mode() -> Iterator[None]:
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    sys.stdout.write("\x1b[?25l")
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)
+        mode = termios.tcgetattr(fd)
+        mode[3] &= ~termios.ISIG
+        termios.tcsetattr(fd, termios.TCSANOW, mode)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+
+
+def _read_key() -> str:
+    fd = sys.stdin.fileno()
+    ch = os.read(fd, 1)
+    if not ch or ch in (b"\x03", b"\x04"):
+        return _KEY_CANCEL
+    if ch in (b"\r", b"\n"):
+        return _KEY_ENTER
+    if ch == b" ":
+        return _KEY_SPACE
+    if ch in (b"k", b"K"):
+        return _KEY_UP
+    if ch in (b"j", b"J"):
+        return _KEY_DOWN
+    if ch == b"\x1b":
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready or os.read(fd, 1) != b"[":
+            return _KEY_OTHER
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            return _KEY_OTHER
+        arrow = os.read(fd, 1)
+        if arrow == b"A":
+            return _KEY_UP
+        if arrow == b"B":
+            return _KEY_DOWN
+    return _KEY_OTHER
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _visible_width(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+
+def _physical_rows(text: str) -> int:
+    cols = shutil.get_terminal_size((80, 24)).columns
+    rows = 0
+    for line in text.split("\n")[:-1]:
+        rows += max(1, (_visible_width(line) + cols - 1) // cols)
+    return rows
+
+
+def _erase(rows: int) -> None:
+    if rows <= 0:
+        return
+    sys.stdout.write(f"\x1b[{rows}F\x1b[J")
+    sys.stdout.flush()
+
+
+def tui_select[T](
+    message: str,
+    choices: list[tuple[str, T, str]],
+    *,
+    initial: T | None = None,
+    summary_message: str | None = None,
+) -> T | None:
+    _tty_required()
+    if not choices:
+        return None
+
+    qmark = _sty("1;34", "?")
+    pointer = _sty("1;34", "❯ ")
+
+    idx = 0
+    if initial is not None:
+        for i, (_, value, _) in enumerate(choices):
+            if value == initial:
+                idx = i
+                break
+    rendered = 0
+    final_message = summary_message or message
+
+    def render(final_label: str | None = None) -> None:
+        nonlocal rendered
+        _erase(rendered)
+        prompt = final_message if final_label is not None else message
+        out = [f"{qmark} {_bold(prompt)}"]
+        if final_label is None:
+            out.append("\n")
+            for i, (label, _, _) in enumerate(choices):
+                if i == idx:
+                    prefix = pointer
+                    radio = _sty("34", "●")
+                else:
+                    prefix = "  "
+                    radio = "○"
+                out.append(f"{prefix}{radio} {label}\n")
+            out.append("\n")
+            for line in choices[idx][2].splitlines():
+                out.append(f"  {_sty('2', line)}\n")
+        else:
+            out.append(f" {_sty('34', final_label)}\n")
+        text = "".join(out)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        rendered = _physical_rows(text)
+
+    with _raw_mode():
+        render()
+        while True:
+            key = _read_key()
+            if key == _KEY_CANCEL:
+                _erase(rendered)
+                return None
+            if key == _KEY_ENTER:
+                label, value, _ = choices[idx]
+                render(final_label=label)
+                return value
+            if key == _KEY_UP:
+                idx = (idx - 1) % len(choices)
+                render()
+            elif key == _KEY_DOWN:
+                idx = (idx + 1) % len(choices)
+                render()
+
+
+def tui_checkbox[T](
+    message: str,
+    choices: list[tuple[str, T, bool]],
+    *,
+    summary_message: str | None = None,
+    details: str | None = None,
+) -> list[T] | None:
+    _tty_required()
+    if not choices:
+        return []
+
+    qmark = _sty("1;34", "?")
+    pointer = _sty("1;34", "❯ ")
+    approve_label = "Submit selection"
+    approve_idx = len(choices)
+
+    idx = approve_idx
+    checked = [c for _, _, c in choices]
+    rendered = 0
+    final_message = summary_message or message
+
+    def render(final: bool = False) -> None:
+        nonlocal rendered
+        _erase(rendered)
+        prompt = final_message if final else message
+        out = [f"{qmark} {_bold(prompt)}"]
+        if final:
+            picked = [str(v) for (_, v, _), c in zip(choices, checked, strict=True) if c]
+            answer = ", ".join(picked) if picked else "(none)"
+            out.append(f" {_sty('34', answer)}\n")
+        else:
+            out.append("\n")
+            if details is not None:
+                for line in details.splitlines():
+                    out.append(f"  {_sty('2', line)}\n")
+                out.append("\n")
+            for i, (label, _, _) in enumerate(choices):
+                prefix = pointer if i == idx else "  "
+                box = "[x]" if checked[i] else "[ ]"
+                if checked[i]:
+                    box = _sty("34", box)
+                out.append(f"{prefix}{box} {label}\n")
+            out.append("\n")
+            if idx == approve_idx:
+                out.append(f"{pointer}{_sty('1;32', approve_label)}\n")
+            else:
+                out.append(f"  {approve_label}\n")
+        text = "".join(out)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        rendered = _physical_rows(text)
+
+    with _raw_mode():
+        render()
+        while True:
+            key = _read_key()
+            if key == _KEY_CANCEL:
+                _erase(rendered)
+                return None
+            if key in (_KEY_ENTER, _KEY_SPACE):
+                if idx == approve_idx:
+                    render(final=True)
+                    return [v for (_, v, _), c in zip(choices, checked, strict=True) if c]
+                checked[idx] = not checked[idx]
+                render()
+            elif key == _KEY_UP:
+                idx = (idx - 1) % (len(choices) + 1)
+                render()
+            elif key == _KEY_DOWN:
+                idx = (idx + 1) % (len(choices) + 1)
+                render()
+
+
+HELP_TEXT = f"""\
+{_bold("Usage:")} agent [SUBCOMMAND] [-- EXTRA_ARGS...]
+
+Launch a Nix-built agent workspace in the current directory.
+With no subcommand, runs claude. Extra args after `--` are forwarded
+to claude (or to bash with `shell`).
+
+{_bold("Subcommands:")}
+  {_bold("setup")}    Configure agent (interactive)
+  {_bold("shell")}    Open a bash shell instead of running claude
+  {_bold("build")}    Build the container image (via Nix) and exit
+  {_bold("update")}   Update flake.lock (pin inputs to latest) and exit
+  {_bold("clean")}    Remove the container image and Nix store cache
+  {_bold("check")}    Validate the Nix expression without building
+  {_bold("doctor")}   Run environment health checks
+  {_bold("help")}     Show this help message and exit
+"""
+
+SUBCOMMANDS = {"setup", "shell", "build", "update", "clean", "check", "doctor", "help"}
+
+
+def die(msg: str) -> NoReturn:
+    label = _sty("1;31", "error", err=True)
+    print(f"agent: {label}: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def warn(msg: str) -> None:
+    label = _sty("1;33", "warning", err=True)
+    print(f"agent: {label}: {msg}", file=sys.stderr)
+
+
+def settings_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "agent-container" / "settings.json"
+
+
+def load_settings() -> dict[str, Any]:
+    path = settings_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return dict(DEFAULT_SETTINGS)
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"malformed settings file {path}: {e}\nRun `agent setup` to recreate it.")
+    if not isinstance(loaded, dict):
+        die(f"malformed settings file {path}: expected JSON object\nRun `agent setup` to recreate it.")
+    result = dict(DEFAULT_SETTINGS)
+    for key, value in loaded.items():
+        if key in DEFAULT_SETTINGS:
+            result[key] = value
+        else:
+            warn(f"ignoring unknown setting {key!r} in {path}")
+    if result["container_engine"] not in CONTAINER_ENGINES:
+        warn(f"unknown container_engine {result['container_engine']!r} in {path}; using {DEFAULT_SETTINGS['container_engine']!r}")
+        result["container_engine"] = DEFAULT_SETTINGS["container_engine"]
+    valid_modes = {"pwd", "repo_root"}
+    if result["mount_mode"] not in valid_modes:
+        warn(f"unknown mount_mode {result['mount_mode']!r} in {path}; using {DEFAULT_SETTINGS['mount_mode']!r}")
+        result["mount_mode"] = DEFAULT_SETTINGS["mount_mode"]
+    raw_shared = result["shared_host_paths"]
+    if not isinstance(raw_shared, list):
+        warn(f"shared_host_paths in {path} is not a list; ignoring")
+        result["shared_host_paths"] = []
+    else:
+        allowlisted = {host for host, _, _ in SHARED_HOST_PATHS_ALLOWLIST}
+        filtered: list[SharedHostPath] = []
+        for entry in raw_shared:
+            if isinstance(entry, str):
+                if entry in allowlisted:
+                    filtered.append(entry)
+                    continue
+                warn(
+                    f"dropping shared_host_paths entry {entry!r} from {path}: "
+                    f"unknown host with no container mapping; use {{host: ..., container: ...}} form for custom mounts"
+                )
+                continue
+            if isinstance(entry, dict):
+                host = _shared_host_entry_host(entry)
+                container = _shared_host_entry_container(entry)
+                if host and container:
+                    filtered.append({"host": host, "container": container})
+                    continue
+            warn(f"ignoring malformed shared_host_paths entry {entry!r} in {path}")
+        result["shared_host_paths"] = filtered
+    return result
+
+
+def save_settings(values: dict[str, Any]) -> None:
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".settings.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(values, f, indent=2, sort_keys=True)
+            f.write("\n")
+        tmp.chmod(0o644)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _detect_engine() -> str:
+    for candidate in CONTAINER_ENGINES:
+        if shutil.which(candidate):
+            return candidate
+    return CONTAINER_ENGINES[0]
+
+
+def _ask_questions(current: dict[str, Any]) -> dict[str, Any] | None:
+    result = dict(current)
+
+    default_marker = _sty("34", "(default)")
+
+    default_engine = DEFAULT_SETTINGS["container_engine"]
+    engine_choices: list[tuple[str, str, str]] = []
+    for value in CONTAINER_ENGINES:
+        label = value
+        if value == default_engine:
+            label = f"{label} {default_marker}"
+        if value == "docker":
+            description = "Most common setup; usually works without extra tuning.\nBest default for compatibility across machines and docs."
+        else:
+            description = "Daemonless engine with strong rootless workflows.\nUseful if you already use Podman, but less universal."
+        engine_choices.append((label, value, description))
+    engine_initial = current.get("container_engine") or _detect_engine()
+    engine = tui_select(
+        "Which container engine should agent use to run your workspace?",
+        engine_choices,
+        initial=engine_initial,
+        summary_message="Container engine",
+    )
+    if engine is None:
+        return None
+    result["container_engine"] = engine
+
+    default_mount = DEFAULT_SETTINGS["mount_mode"]
+    mount_choices: list[tuple[str, str, str]] = []
+    for label, value in [
+        ("repository root (walk up to .git)", "repo_root"),
+        ("current directory only", "pwd"),
+    ]:
+        if value == default_mount:
+            label = f"{label} {default_marker}"
+        if value == "pwd":
+            description = (
+                "Share only this directory from the host with the container.\n"
+                "Keeps access narrow, but sibling packages stay outside the workspace."
+            )
+        else:
+            description = (
+                "Walk up to .git and share the whole repository root from the host.\n"
+                "Best for multi-package work, but exposes more project files."
+            )
+        mount_choices.append((label, value, description))
+
+    mount_mode = tui_select(
+        "How should agent choose which workspace directory to mount?",
+        mount_choices,
+        initial=current["mount_mode"],
+        summary_message="Workspace mount",
+    )
+    if mount_mode is None:
+        return None
+    result["mount_mode"] = mount_mode
+
+    current_shared = current.get("shared_host_paths", [])
+    selected_builtin_hosts = {entry for entry in current_shared if isinstance(entry, str)}
+    allowlisted = [
+        (host, desc) for host, _, desc in SHARED_HOST_PATHS_ALLOWLIST if Path(host).expanduser().exists() or host in selected_builtin_hosts
+    ]
+    custom_entries: list[tuple[str, SharedHostPath]] = []
+    for entry in current_shared:
+        if not isinstance(entry, dict):
+            continue
+        host = _shared_host_entry_host(entry)
+        container = _shared_host_entry_container(entry)
+        if host is None or container is None:
+            continue
+        label = f"{host} -> {container}  custom read-only mount"
+        custom_entries.append((label, {"host": host, "container": container}))
+    available = [(f"{host}  {desc}", host, host in selected_builtin_hosts) for host, desc in allowlisted] + [
+        (label, value, True) for label, value in custom_entries
+    ]
+    if available:
+        shared = tui_checkbox(
+            "Which extra host paths should be mounted read-only into the container?",
+            available,
+            summary_message="Read-only host mounts",
+            details=(
+                "These mounts add host files or directories at fixed paths inside the container.\n"
+                "Useful for config and auth, but each mount exposes more host state.\n"
+                "Add custom entries by editing settings.json and re-running `agent setup`."
+            ),
+        )
+        if shared is None:
+            return None
+        result["shared_host_paths"] = shared
+    else:
+        result["shared_host_paths"] = []
+
+    return result
+
+
+def run_setup() -> None:
+    _tty_required()
+    path = settings_path()
+    current = load_settings() if path.exists() else dict(DEFAULT_SETTINGS)
+
+    print(_sty("2", f"Setup writes to {path}"))
+    print()
+
+    try:
+        updated = _ask_questions(current)
+    except (KeyboardInterrupt, EOFError):
+        sys.exit(1)
+    if updated is None:
+        sys.exit(1)
+    save_settings(updated)
+
+    print()
+    print(f"{_sty('1;32', '✓')} Saved.")
+
+
+def _query_nofile_hard_limit(engine: str, image: str) -> str | None:
+    """Run `ulimit -Hn` inside the agent container.
+    Returns a decimal string, 'unlimited', or None if the image isn't built."""
+    if not image_exists(engine, image):
+        return None
+    r = subprocess.run(
+        [engine, "run", "--rm", image, "sh", "-c", "ulimit -Hn"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        die(f"could not query NOFILE limit in agent container:\n{r.stderr.strip() or 'unknown error'}")
+    return r.stdout.strip()
+
+
+_NOFILE_FIX_PODMAN_DARWIN = r"""podman machine ssh -- sudo mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
+podman machine ssh -- sudo bash -c 'printf "%s\n" "[Manager]" "DefaultLimitNOFILE=524288" > /etc/systemd/system.conf.d/nofile.conf'
+podman machine ssh -- sudo bash -c 'printf "%s\n" "[Manager]" "DefaultLimitNOFILE=524288" > /etc/systemd/user.conf.d/nofile.conf'
+podman machine stop
+podman machine start"""
+
+_NOFILE_FIX_PODMAN_LINUX = r"""sudo mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
+sudo bash -c 'printf "%s\n" "[Manager]" "DefaultLimitNOFILE=524288" > /etc/systemd/system.conf.d/nofile.conf'
+sudo bash -c 'printf "%s\n" "[Manager]" "DefaultLimitNOFILE=524288" > /etc/systemd/user.conf.d/nofile.conf'
+# then log out and back in so the user session picks up the new limit"""
+
+_NOFILE_FIX_DOCKER_DARWIN = r"""# Open Docker Desktop → Settings → Docker Engine and merge into the JSON:
+#   "default-ulimits": {
+#     "nofile": { "Name": "nofile", "Hard": 524288, "Soft": 524288 }
+#   }
+# Click "Apply & restart"."""
+
+_NOFILE_FIX_DOCKER_LINUX = r"""sudo mkdir -p /etc/docker
+# Edit /etc/docker/daemon.json and merge in:
+#   "default-ulimits": {
+#     "nofile": { "Name": "nofile", "Hard": 524288, "Soft": 524288 }
+#   }
+sudo systemctl reload docker"""
+
+# (engine, is_darwin) → fix block
+_NOFILE_FIX: dict[tuple[str, bool], str] = {
+    ("podman", True): _NOFILE_FIX_PODMAN_DARWIN,
+    ("podman", False): _NOFILE_FIX_PODMAN_LINUX,
+    ("docker", True): _NOFILE_FIX_DOCKER_DARWIN,
+    ("docker", False): _NOFILE_FIX_DOCKER_LINUX,
+}
+
+
+def _doctor_pass(label: str, value: str, width: int) -> None:
+    mark = _sty("1;32", "●")
+    print(f"  {mark}  {label.ljust(width)}  {_sty('2', value)}")
+
+
+def _doctor_warn(label: str, value: str, width: int) -> None:
+    mark = _sty("1;33", "●")
+    print(f"  {mark}  {label.ljust(width)}  {value}")
+
+
+def _doctor_block(text: str) -> None:
+    bar = _sty("2", "│")
+    for line in text.split("\n"):
+        if line.startswith("#"):
+            print(f"    {bar} {_sty('2', line)}")
+        else:
+            print(f"    {bar} {_sty('36', line)}")
+
+
+def run_doctor(engine: str, image: str) -> None:
+    print(_sty("1;34", "agent doctor"))
+    print()
+
+    label_w = 14
+    _doctor_pass(engine, "running", label_w)
+
+    warn_at = 1024
+    recommended = 524288
+    raw = _query_nofile_hard_limit(engine, image)
+    if raw is None:
+        _doctor_warn(
+            "NOFILE limit",
+            f"{_sty('2', 'skipped — run `agent build` first to check inside the real container')}",
+            label_w,
+        )
+        print()
+        return
+    location = "agent container"
+    if raw == "unlimited":
+        _doctor_pass("NOFILE limit", f"unlimited  ·  {location}", label_w)
+        print()
+        return
+    try:
+        limit = int(raw)
+    except ValueError:
+        die(f"unexpected NOFILE value from {location}: {raw!r}")
+    if limit > warn_at:
+        _doctor_pass("NOFILE limit", f"{limit}  ·  {location}", label_w)
+        print()
+        return
+
+    _doctor_warn(
+        "NOFILE limit",
+        f"{_sty('1;33', str(limit))}  ·  {location}  {_sty('2', f'(recommend {recommended})')}",
+        label_w,
+    )
+    print()
+    arrow = _sty("1;33", "→")
+    print(f"  {arrow} {_bold('Why it matters')}")
+    print(_sty("2", "    The 1024 hard cap is a systemd default, kept for select(2) safety."))
+    print(_sty("2", "    Heavy parallel builds (e.g. `lake build`) blow past it."))
+    print()
+    if engine == "podman":
+        where = "podman machine VM" if sys.platform == "darwin" else "host systemd config"
+    else:
+        where = "Docker Desktop settings" if sys.platform == "darwin" else "docker daemon.json"
+    print(f"  {arrow} {_bold('Fix')} {_sty('2', f'— raise NOFILE in the {where}:')}")
+    print()
+    fix = _NOFILE_FIX[engine, sys.platform == "darwin"]
+    _doctor_block(fix)
+    if engine == "podman" and sys.platform == "darwin":
+        print()
+        print(_sty("2", "    Wiped if you `podman machine rm` and recreate the VM."))
+    print()
+    sys.exit(1)
+
+
+def resolve_repo_root(pwd: Path, home: Path) -> Path:
+    """Walk up from pwd for an ancestor containing `.git` (dir or file),
+    bounded by home (exclusive). Return the first match, or pwd if none.
+    `$HOME` itself is never returned even if it contains `.git` — otherwise
+    a dotfiles-as-git-repo setup would mount the whole home directory."""
+    p = pwd
+    while p != home:
+        if (p / ".git").exists():
+            return p
+        parent = p.parent
+        if parent == p:
+            break
+        try:
+            parent.relative_to(home)
+        except ValueError:
+            break
+        p = parent
+    return pwd
+
+
+_ENGINE_INSTALL_HINT = {
+    "podman": "https://podman.io/docs/installation",
+    "docker": "https://docs.docker.com/get-docker/",
+}
+
+
+def check_engine(engine: str) -> None:
+    if not shutil.which(engine):
+        die(f"{engine} not in PATH\nInstall: {_ENGINE_INSTALL_HINT[engine]}")
+
+    if engine == "podman" and sys.platform == "darwin":
+        r = subprocess.run(
+            ["podman", "machine", "list", "--format", "{{.Running}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        running = any(line.strip() == "true" for line in r.stdout.splitlines())
+        if not running:
+            die("no running podman machine\nRemediation: podman machine start")
+
+    r = _run_quiet([engine, "info"])
+    if r.returncode != 0:
+        stderr = r.stderr.decode(errors="replace").strip()
+        die(f"`{engine} info` failed:\n{stderr}")
+
+
+def image_exists(engine: str, image: str) -> bool:
+    if engine == "podman":
+        cmd = ["podman", "image", "exists", image]
+    else:
+        cmd = ["docker", "image", "inspect", image]
+    return _run_quiet(cmd).returncode == 0
+
+
+def runtime_nix_volume_name(image_id: str) -> str:
+    # Keyed by image content so each build gets its own /nix volume.
+    # Lets concurrent agents on different builds keep working — old container
+    # holds its image+volume, new run gets a fresh pair. Stale volumes from
+    # prior builds accumulate until `agent clean`.
+    short = image_id.removeprefix("sha256:")[:12]
+    if not short:
+        die(f"unexpected empty image id: {image_id!r}")
+    return f"{RUNTIME_NIX_VOLUME_PREFIX}{short}"
+
+
+def inspect_image_id(engine: str, image: str) -> str:
+    r = subprocess.run(
+        [engine, "inspect", "--format", "{{.Id}}", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        die(f"could not inspect {image}:\n{r.stderr.strip() or f'exit {r.returncode}'}")
+    return r.stdout.strip()
+
+
+def build_container_name(uid: int, gid: int) -> str:
+    return f"agent-build-u{uid}g{gid}"
+
+
+def _is_container_running(engine: str, name: str) -> bool:
+    r = subprocess.run(
+        [engine, "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return any(line.strip() == name for line in r.stdout.splitlines())
+
+
+def _run_quiet(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(cmd, capture_output=True, check=False)
+
+
+def _clean_step(label: str, cmd: list[str], *, missing_ok: bool = False) -> None:
+    print(f"{_sty('1;34', '→')} {label}...")
+    r = _run_quiet(cmd)
+    stderr = r.stderr.decode(errors="replace").strip()
+    if r.returncode == 0:
+        print(f"{_sty('1;32', '✓')} {label}.")
+        return
+    if missing_ok:
+        missing_markers = (
+            "No such image",
+            "No such object",
+            "No such volume",
+            "not found",
+        )
+        if any(marker in stderr for marker in missing_markers):
+            print(f"{_sty('2', '•')} {label}: already absent.")
+            return
+    warn(f"{label} failed: {stderr or f'exit {r.returncode}'}")
+
+
+def _resources_in_use(engine: str) -> tuple[set[str], set[str]]:
+    """Return (short_image_ids, volume_names) currently in use by running containers."""
+    r = subprocess.run(
+        [engine, "ps", "-aq", "--no-trunc"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return set(), set()
+    container_ids = [c.strip() for c in r.stdout.splitlines() if c.strip()]
+    ri = subprocess.run(
+        [engine, "inspect", "--format", "{{.Image}}", *container_ids],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    image_ids: set[str] = set()
+    if ri.returncode == 0:
+        for raw in ri.stdout.splitlines():
+            raw = raw.strip()
+            if raw:
+                image_ids.add(raw.removeprefix("sha256:")[:12])
+    rv = subprocess.run(
+        [engine, "inspect", "--format", "{{range .Mounts}}{{if .Name}}{{.Name}}\n{{end}}{{end}}", *container_ids],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    vol_names: set[str] = set()
+    if rv.returncode == 0:
+        for raw in rv.stdout.splitlines():
+            raw = raw.strip()
+            if raw:
+                vol_names.add(raw)
+    return image_ids, vol_names
+
+
+def run_clean(engine: str) -> None:
+    in_use_ids, in_use_vols = _resources_in_use(engine)
+
+    print(f"{_sty('1;34', '→')} Inspecting agent images...")
+    r = subprocess.run(
+        [engine, "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}", "agent"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        die(f"could not list agent images:\n{r.stderr.strip() or f'exit {r.returncode}'}")
+
+    tag_rows: list[tuple[str, str]] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            tag_rows.append((parts[0], parts[1]))
+    skipped_tags = [tag for tag, img_id in tag_rows if img_id[:12] in in_use_ids]
+    tags = [tag for tag, img_id in tag_rows if img_id[:12] not in in_use_ids]
+    if skipped_tags:
+        print(f"{_sty('2', '•')} Skipping in-use images: {', '.join(skipped_tags)}")
+    if tags:
+        print(f"{_sty('2', '•')} Found images: {', '.join(tags)}")
+        _clean_step("Removing agent images", [engine, "rmi", *tags], missing_ok=True)
+    else:
+        print(f"{_sty('2', '•')} Removing agent images: nothing to do.")
+
+    print(f"{_sty('1;34', '→')} Inspecting runtime nix volumes...")
+    r = subprocess.run(
+        [engine, "volume", "ls", "--filter", f"name={RUNTIME_NIX_VOLUME_PREFIX}", "--format", "{{.Name}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    all_vols = [v.strip() for v in r.stdout.splitlines() if v.strip()]
+    skipped_vols = [v for v in all_vols if v in in_use_vols]
+    vols = [v for v in all_vols if v not in in_use_vols]
+    if skipped_vols:
+        print(f"{_sty('2', '•')} Skipping in-use volumes: {', '.join(skipped_vols)}")
+    if vols:
+        print(f"{_sty('2', '•')} Found runtime volumes: {', '.join(vols)}")
+        _clean_step(
+            f"Removing {len(vols)} runtime nix volume(s)",
+            [engine, "volume", "rm", *vols],
+            missing_ok=True,
+        )
+    else:
+        print(f"{_sty('2', '•')} Removing runtime nix volumes: nothing to do.")
+    print(f"{_sty('1;32', '✓')} Clean finished.")
+
+
+def build(engine: str, image: str) -> None:
+    uid, gid = os.getuid(), os.getgid()
+    build_name = build_container_name(uid, gid)
+    if _is_container_running(engine, build_name):
+        print(f"{_sty('1;34', '→')} Another build is already running ({build_name}); waiting for it to finish...")
+        r = subprocess.run([engine, "wait", build_name], capture_output=True, text=True, check=False)
+        if r.returncode != 0:
+            die(f"failed to wait for concurrent build {build_name}:\n{r.stderr.strip() or f'exit {r.returncode}'}")
+        # `engine wait` prints the container's exit code(s) on stdout.
+        failed = [code for code in r.stdout.strip().splitlines() if code and code != "0"]
+        if failed:
+            die(f"concurrent build {build_name} exited with status {failed[0]!r}; rerun `agent build`")
+        # Peer's `engine load`/`engine tag` may still be in flight after the
+        # container exits; if the image isn't yet visible, ask the user to retry.
+        if not image_exists(engine, image):
+            die(f"concurrent build {build_name} finished but image {image} is not yet tagged; rerun shortly")
+        return
+    # Clear any stopped leftover (e.g. from a crash) so `--name` can claim it.
+    _run_quiet([engine, "rm", build_name])
+    _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
+    print(f"{_sty('1;34', '→')} Building...")
+    build_proc = subprocess.Popen(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--name",
+            build_name,
+            "-v",
+            f"{NIX_BUILD_CACHE_VOLUME}:/nix",
+            "-v",
+            f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z",
+            "-e",
+            f"AGENT_UID={uid}",
+            "-e",
+            f"AGENT_GID={gid}",
+            NIX_IMAGE,
+            "sh",
+            "-c",
+            'cat "$(nix build path:/build#image --no-link --print-out-paths'
+            " --impure --extra-experimental-features 'nix-command flakes')\"",
+        ],
+        stdout=subprocess.PIPE,
+    )
+    assert build_proc.stdout is not None
+    print(f"{_sty('1;34', '→')} Loading...")
+    load = subprocess.run(
+        [engine, "load"],
+        stdin=build_proc.stdout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    build_proc.stdout.close()
+    build_rc = build_proc.wait()
+    if build_rc != 0:
+        die(f"nix build failed (exit {build_rc})")
+    if load.returncode != 0:
+        die(f"{engine} load failed:\n{load.stderr}")
+    # podman prefixes loaded images with `localhost/`; docker does not.
+    m = re.search(r"(?:localhost/)?agent:[a-z0-9]+", load.stdout)
+    if m is None:
+        die(f"could not extract image tag from `{engine} load` output:\n{load.stdout.strip() or '(empty)'}")
+    subprocess.run([engine, "tag", m.group(0), image], check=True)
+    print(f"{_sty('1;32', '✓')} Tagged {m.group(0)} as {image}")
+    # No volume removal: runtime volume name is derived from image ID at
+    # `agent run`, so the new image gets its own fresh volume on first use.
+    # Any agent still running against the previous image keeps its volume.
+
+
+def run_update(engine: str) -> None:
+    _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
+    print(f"{_sty('1;34', '→')} Updating flake.lock...")
+    subprocess.run(
+        [
+            engine,
+            "run",
+            "--rm",
+            "-v",
+            f"{NIX_BUILD_CACHE_VOLUME}:/nix",
+            "-v",
+            f"{SCRIPT_DIR / 'agent-image'}:/build",
+            NIX_IMAGE,
+            "sh",
+            "-c",
+            "cd /build && nix flake update --extra-experimental-features 'nix-command flakes'",
+        ],
+        check=True,
+    )
+    print(f"{_sty('1;32', '✓')} flake.lock updated.")
+    r = subprocess.run(
+        ["git", "-C", str(SCRIPT_DIR), "diff", "--quiet", "HEAD", "--", "agent-image/flake.lock"],
+        check=False,
+    )
+    if r.returncode == 0:
+        print(_sty("2", "  flake.lock unchanged — nothing to commit."))
+        return
+    subprocess.run(["git", "-C", str(SCRIPT_DIR), "add", "agent-image/flake.lock"], check=True)
+    subprocess.run(
+        ["git", "-C", str(SCRIPT_DIR), "commit", "-m", "Update flake.lock"],
+        check=True,
+    )
+    print(f"{_sty('1;32', '✓')} Committed.")
+
+
+def parse_args(argv: list[str]) -> tuple[str, list[str]]:
+    if not argv:
+        return "run", []
+    if argv[0] == "--":
+        return "run", argv[1:]
+    if argv[0] in SUBCOMMANDS:
+        rest = argv[1:]
+        if rest and rest[0] == "--":
+            rest = rest[1:]
+        return argv[0], rest
+    die(f"unknown subcommand: {argv[0]!r} (run `agent help`)")
+
+
+def main() -> None:
+    cmd, extra = parse_args(sys.argv[1:])
+
+    if cmd == "help":
+        print(HELP_TEXT, end="")
+        return
+
+    if cmd == "setup":
+        run_setup()
+        return
+
+    if not settings_path().exists():
+        run_setup()
+    settings = load_settings()
+    engine = settings["container_engine"]
+
+    # Image is UID-keyed because the agent user inside it is baked at build time.
+    image = os.environ.get("AGENT_IMAGE", f"agent:u{os.getuid()}g{os.getgid()}")
+
+    check_engine(engine)
+
+    if cmd == "doctor":
+        run_doctor(engine, image)
+        return
+
+    if cmd == "clean":
+        run_clean(engine)
+        return
+
+    if cmd == "update":
+        run_update(engine)
+        return
+
+    if cmd == "check":
+        subprocess.run(
+            [
+                engine,
+                "run",
+                "--rm",
+                "-v",
+                f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z",
+                NIX_IMAGE,
+                "nix",
+                "flake",
+                "check",
+                "path:/build",
+                "--impure",
+                "--extra-experimental-features",
+                "nix-command flakes",
+            ],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        return
+
+    if cmd == "build":
+        build(engine, image)
+        return
+
+    if not image_exists(engine, image):
+        build(engine, image)
+
+    cwd = Path.cwd().resolve()
+    if settings["mount_mode"] == "repo_root":
+        mount_root = resolve_repo_root(cwd, Path.home().resolve())
+    else:
+        mount_root = cwd
+
+    xdg_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    data_dir = xdg_data / "agent-container"
+    home_dir = data_dir / "home"
+    first_run = not data_dir.exists()
+    home_dir.mkdir(parents=True, exist_ok=True)
+    if first_run:
+        (data_dir / "README").write_text(
+            "This directory is managed by agent-container.\n"
+            "It persists the home directory of the in-container agent across runs.\n"
+            "It also persists the in-container /nix store across runs via a container volume.\n"
+            "\n"
+            "  home/   bind-mounted as /home/agent/ inside the container\n"
+        )
+
+    # `:z` relabels bind mounts with a shared SELinux context so the container
+    # can access them on SELinux-enforced hosts (Fedora, RHEL). The relabel is
+    # destructive — it `chcon`s the host paths in place — so apply only to the
+    # dedicated container home dir, never to user files (workspace, dotfiles,
+    # credential cache). Containers there get a relabel via the host-side
+    # `container_file_t` rule on $XDG_DATA_HOME, or the user can chcon
+    # manually.
+    uid, gid = os.getuid(), os.getgid()
+    runtime_nix_volume = runtime_nix_volume_name(inspect_image_id(engine, image))
+    # Do NOT pre-create the volume here. Docker only seeds a named volume from
+    # image content when Docker itself creates it during `docker run`. If the
+    # volume already exists (even empty), Docker skips seeding and mounts an
+    # empty /nix, making all Nix-store executables unreachable.
+
+    mount_specs = [
+        f"{mount_root}:{mount_root}",
+        f"{home_dir}:/home/agent:z",
+    ]
+    if Path("/etc/localtime").is_file():
+        mount_specs.append("/etc/localtime:/etc/localtime:ro")
+    cred_cache = Path.home() / ".cache/git/credential"
+    if cred_cache.is_dir():
+        mount_specs.append(f"{cred_cache}:/home/agent/.cache/git/credential")
+    allowlist_container = {host: container for host, container, _ in SHARED_HOST_PATHS_ALLOWLIST}
+    for entry in settings["shared_host_paths"]:
+        if isinstance(entry, dict):
+            host_pattern = _shared_host_entry_host(entry)
+            container_path = _shared_host_entry_container(entry)
+            if host_pattern is None or container_path is None:
+                continue
+        elif isinstance(entry, str):
+            host_pattern = entry
+            container_path = allowlist_container.get(entry)
+            if container_path is None:
+                continue
+        else:
+            continue
+        host_path = Path(host_pattern).expanduser()
+        if not host_path.exists():
+            continue
+        mount_specs.append(f"{host_path}:{container_path}:ro")
+    mount_flags = [arg for m in mount_specs for arg in ("-v", m)]
+
+    base = [engine, "run", "--rm", "-it", "--user", f"{uid}:{gid}"]
+    if engine == "podman":
+        # Rootless podman: map host UID to itself inside the user namespace.
+        # Docker has no equivalent — rootless docker already runs as the host
+        # uid, and rootful docker maps `--user` directly without a userns, so
+        # don't add `--userns=keep-id` for docker.
+        base.append("--userns=keep-id")
+    base += [
+        "--memory-swap=-1",
+        "--ulimit", "nofile=524288:524288",
+        "-v",
+        f"{runtime_nix_volume}:/nix",
+        *mount_flags,
+        "-w",
+        str(cwd),
+    ]
+
+    # SSH agent forwarding — key never enters the container.
+    # macOS + Docker Desktop: socket injected by Docker Desktop at a fixed path.
+    # Linux: forward the host socket via bind-mount.
+    if sys.platform == "darwin" and engine == "docker":
+        base += ["-e", "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock"]
+    elif sys.platform != "darwin":
+        _ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
+        if _ssh_sock and Path(_ssh_sock).is_socket():
+            base += ["-v", f"{_ssh_sock}:{_ssh_sock}", "-e", f"SSH_AUTH_SOCK={_ssh_sock}"]
+
+    if cmd == "shell":
+        tail = ["--entrypoint", "bash", image, *extra]
+    else:
+        tail = [image, "claude", "--dangerously-skip-permissions", *extra]
+
+    os.execvp(engine, [*base, *tail])
+
+
+if __name__ == "__main__":
+    main()

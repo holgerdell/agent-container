@@ -1,0 +1,6 @@
+tmp
+__pycache__
+.claude
+.mypy_cache
+.pytest_cache
+.ruff_cache

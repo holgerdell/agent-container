@@ -1,0 +1,15 @@
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+.venv
+.venv-linux
+.venv-macos
+__pycache__
+.ruff_cache
+.mypy_cache
+.pytest_cache
