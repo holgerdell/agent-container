@@ -20,6 +20,7 @@ SharedHostPath = str | dict[str, str]
 NIX_IMAGE = "docker.io/nixos/nix:latest"
 NIX_BUILD_CACHE_VOLUME = "agent-nix-store"
 RUNTIME_NIX_VOLUME_PREFIX = "agent-container-nix-"
+HOME_VOLUME_PREFIX = "agent-home-"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -861,6 +862,7 @@ def run_clean(engine: str) -> None:
         )
     else:
         print(f"{_sty('2', '•')} Removing runtime nix volumes: nothing to do.")
+
     print(f"{_sty('1;32', '✓')} Clean finished.")
 
 
@@ -1050,37 +1052,40 @@ def main() -> None:
     else:
         mount_root = cwd
 
-    xdg_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
-    data_dir = xdg_data / "agent-container"
-    home_dir = data_dir / "home"
-    first_run = not data_dir.exists()
-    home_dir.mkdir(parents=True, exist_ok=True)
-    if first_run:
-        (data_dir / "README").write_text(
-            "This directory is managed by agent-container.\n"
-            "It persists the home directory of the in-container agent across runs.\n"
-            "It also persists the in-container /nix store across runs via a container volume.\n"
-            "\n"
-            "  home/   bind-mounted as /home/agent/ inside the container\n"
-        )
-
-    # `:z` relabels bind mounts with a shared SELinux context so the container
-    # can access them on SELinux-enforced hosts (Fedora, RHEL). The relabel is
-    # destructive — it `chcon`s the host paths in place — so apply only to the
-    # dedicated container home dir, never to user files (workspace, dotfiles,
-    # credential cache). Containers there get a relabel via the host-side
-    # `container_file_t` rule on $XDG_DATA_HOME, or the user can chcon
-    # manually.
     uid, gid = os.getuid(), os.getgid()
     runtime_nix_volume = runtime_nix_volume_name(inspect_image_id(engine, image))
     # Do NOT pre-create the volume here. Docker only seeds a named volume from
     # image content when Docker itself creates it during `docker run`. If the
     # volume already exists (even empty), Docker skips seeding and mounts an
     # empty /nix, making all Nix-store executables unreachable.
+    # Same principle applies to the home volume: Docker seeds it from image
+    # content on first creation. Home on a named volume (not a bind mount)
+    # keeps all of ~/.elan, ~/.cache, ~/.local etc on native container fs,
+    # avoiding FUSE/VirtioFS open-file limits (~14K cap vs ~25K+ for Lean builds).
+    home_volume = f"{HOME_VOLUME_PREFIX}u{uid}g{gid}"
+
+    xdg_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    old_home = xdg_data / "agent-container" / "home"
+    volume_missing = _run_quiet([engine, "volume", "inspect", home_volume]).returncode != 0
+    if old_home.is_dir() and volume_missing:
+        print(f"{_sty('1;34', '→')} Migrating old home directory into {home_volume}...")
+        _run_quiet([engine, "volume", "create", home_volume])
+        r = subprocess.run(
+            [engine, "run", "--rm",
+             "-v", f"{old_home}:/mnt/old-home:ro",
+             "-v", f"{home_volume}:/home/agent",
+             "--entrypoint", "sh",
+             image, "-c", "cp -a /mnt/old-home/. /home/agent/"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            warn(f"migration failed: {r.stderr.strip() or f'exit {r.returncode}'}")
+        else:
+            print(f"{_sty('1;32', '✓')} Migrated. Old directory preserved at {old_home}")
 
     mount_specs = [
         f"{mount_root}:{mount_root}",
-        f"{home_dir}:/home/agent:z",
+        f"{home_volume}:/home/agent",
     ]
     if Path("/etc/localtime").is_file():
         mount_specs.append("/etc/localtime:/etc/localtime:ro")
@@ -1107,7 +1112,7 @@ def main() -> None:
         mount_specs.append(f"{host_path}:{container_path}:ro")
     mount_flags = [arg for m in mount_specs for arg in ("-v", m)]
 
-    base = [engine, "run", "--rm", "-it", "--user", f"{uid}:{gid}"]
+    base = [engine, "run", "--rm", "-it", "--init", "--user", f"{uid}:{gid}"]
     if engine == "podman":
         # Rootless podman: map host UID to itself inside the user namespace.
         # Docker has no equivalent — rootless docker already runs as the host
