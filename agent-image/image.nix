@@ -22,9 +22,9 @@ let
       shellcheck shfmt curl cacert git openssh gnupg just
       delta typos uv ruff mypy ty python3 typst
       nix katex texlab
-      nodejs claude-code-pkg opencode starship
+      nodejs bun claude-code-pkg opencode starship
       elan
-      procps htop tmux
+      procps htop tmux poppler-utils
     ];
     ignoreCollisions = true;
     pathsToLink = [ "/bin" "/lib" "/etc" "/share/git-core" "/share/git" "/share/man" ];
