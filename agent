@@ -25,6 +25,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "container_engine": "docker",
+    "env_vars": [],
     "mount_mode": "repo_root",
     "shared_host_paths": [],
 }
@@ -302,11 +303,15 @@ def tui_checkbox[T](
 
 
 HELP_TEXT = f"""\
-{_bold("Usage:")} agent [SUBCOMMAND] [-- EXTRA_ARGS...]
+{_bold("Usage:")} agent [OPTIONS] [SUBCOMMAND] [-- EXTRA_ARGS...]
 
 Launch a Nix-built agent workspace in the current directory.
 With no subcommand, runs claude. Extra args after `--` are forwarded
 to claude (or to bash with `shell`).
+
+{_bold("Options:")}
+  {_bold("--help")}                  Show this help message and exit
+  {_bold("--mount-mode")} MODE       Override workspace mount mode (repo_root|pwd)
 
 {_bold("Subcommands:")}
   {_bold("setup")}    Configure agent (interactive)
@@ -389,6 +394,18 @@ def load_settings() -> dict[str, Any]:
                     continue
             warn(f"ignoring malformed shared_host_paths entry {entry!r} in {path}")
         result["shared_host_paths"] = filtered
+    raw_env = result["env_vars"]
+    if not isinstance(raw_env, list):
+        warn(f"env_vars in {path} is not a list; ignoring")
+        result["env_vars"] = []
+    else:
+        filtered_env: list[str] = []
+        for entry in raw_env:
+            if isinstance(entry, str) and entry:
+                filtered_env.append(entry)
+            else:
+                warn(f"ignoring malformed env_vars entry {entry!r} in {path}")
+        result["env_vars"] = filtered_env
     return result
 
 
@@ -971,21 +988,37 @@ def run_update(engine: str) -> None:
     print(f"{_sty('1;32', '✓')} Committed.")
 
 
-def parse_args(argv: list[str]) -> tuple[str, list[str]]:
-    if not argv:
-        return "run", []
-    if argv[0] == "--":
-        return "run", argv[1:]
-    if argv[0] in SUBCOMMANDS:
-        rest = argv[1:]
+def parse_args(argv: list[str]) -> tuple[str, list[str], dict[str, Any]]:
+    overrides: dict[str, Any] = {}
+    args = list(argv)
+    i = 0
+    while i < len(args) and args[i].startswith("--") and args[i] != "--":
+        flag = args.pop(i)
+        if flag == "--help":
+            return "help", [], overrides
+        if flag.startswith("--mount-mode="):
+            overrides["mount_mode"] = flag.split("=", 1)[1]
+        elif flag == "--mount-mode":
+            if i < len(args):
+                overrides["mount_mode"] = args.pop(i)
+            else:
+                die("--mount-mode requires a value")
+        else:
+            die(f"unknown option: {flag!r} (run `agent help`)")
+    if not args:
+        return "run", [], overrides
+    if args[0] == "--":
+        return "run", args[1:], overrides
+    if args[0] in SUBCOMMANDS:
+        rest = args[1:]
         if rest and rest[0] == "--":
             rest = rest[1:]
-        return argv[0], rest
-    die(f"unknown subcommand: {argv[0]!r} (run `agent help`)")
+        return args[0], rest, overrides
+    die(f"unknown subcommand: {args[0]!r} (run `agent help`)")
 
 
 def main() -> None:
-    cmd, extra = parse_args(sys.argv[1:])
+    cmd, extra, overrides = parse_args(sys.argv[1:])
 
     if cmd == "help":
         print(HELP_TEXT, end="")
@@ -998,6 +1031,10 @@ def main() -> None:
     if not settings_path().exists():
         run_setup()
     settings = load_settings()
+    if "mount_mode" in overrides:
+        if overrides["mount_mode"] not in {"pwd", "repo_root"}:
+            die(f"invalid --mount-mode {overrides['mount_mode']!r}: must be pwd or repo_root")
+        settings["mount_mode"] = overrides["mount_mode"]
     engine = settings["container_engine"]
 
     # Image is UID-keyed because the agent user inside it is baked at build time.
@@ -1111,6 +1148,7 @@ def main() -> None:
             continue
         mount_specs.append(f"{host_path}:{container_path}:ro")
     mount_flags = [arg for m in mount_specs for arg in ("-v", m)]
+    env_flags = [arg for e in settings["env_vars"] for arg in ("-e", e)]
 
     base = [engine, "run", "--rm", "-it", "--init", "--user", f"{uid}:{gid}"]
     if engine == "podman":
@@ -1125,6 +1163,7 @@ def main() -> None:
         "-v",
         f"{runtime_nix_volume}:/nix",
         *mount_flags,
+        *env_flags,
         "-w",
         str(cwd),
     ]
