@@ -21,10 +21,12 @@ let
       fzf gnutar gzip bzip2 xz zstd zip unzip gh jq less man-db nano neovim ripgrep
       shellcheck shfmt curl cacert git openssh gnupg just
       delta typos uv ruff mypy ty python3 typst
+      gcc
       nix katex texlab
       nodejs bun claude-code-pkg opencode starship
       elan
       procps htop tmux poppler-utils
+      time hyperfine
     ];
     ignoreCollisions = true;
     pathsToLink = [ "/bin" "/lib" "/etc" "/share/git-core" "/share/git" "/share/man" ];
