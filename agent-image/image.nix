@@ -1,4 +1,9 @@
-{ pkgs, claude-code-pkg, uid ? 1000, gid ? 1000 }:
+{
+  pkgs,
+  claude-code-pkg,
+  uid ? 1000,
+  gid ? 1000,
+}:
 let
   lib = pkgs.lib;
 
@@ -17,19 +22,71 @@ let
   env = pkgs.buildEnv {
     name = "agent-env";
     paths = with pkgs; [
-      bashInteractive coreutils findutils gnused gawk diffutils sudo which
-      fzf gnutar gzip bzip2 xz zstd zip unzip gh jq less man-db nano neovim ripgrep
-      shellcheck shfmt curl cacert git openssh gnupg just
-      delta typos uv ruff mypy ty python3 typst
-      gcc
-      nix katex texlab
-      nodejs bun claude-code-pkg opencode starship
+      bashInteractive
+      bun
+      bzip2
+      cacert
+      claude-code-pkg
+      coreutils
+      curl
+      delta
+      diffutils
       elan
-      procps htop tmux poppler-utils
-      time hyperfine
+      findutils
+      fzf
+      gawk
+      gcc
+      gh
+      git
+      gnupg
+      gnused
+      gnutar
+      gzip
+      htop
+      hyperfine
+      jq
+      just
+      katex
+      less
+      man-db
+      mypy
+      nano
+      neovim
+      nix
+      nodejs
+      opencode
+      openssh
+      poppler-utils
+      procps
+      python3
+      ripgrep
+      ruff
+      shellcheck
+      shfmt
+      starship
+      sudo
+      texlab
+      time
+      tmux
+      ty
+      typos
+      typst
+      uv
+      unzip
+      which
+      xz
+      zip
+      zstd
     ];
     ignoreCollisions = true;
-    pathsToLink = [ "/bin" "/lib" "/etc" "/share/git-core" "/share/git" "/share/man" ];
+    pathsToLink = [
+      "/bin"
+      "/lib"
+      "/etc"
+      "/share/git-core"
+      "/share/git"
+      "/share/man"
+    ];
   };
 
   # Libraries exposed to unpatched ELF binaries (e.g. pip/uv wheels) via nix-ld.
@@ -37,8 +94,20 @@ let
   # (nixos/modules/programs/nix-ld.nix). Extend for heavier wheels:
   # torch/scipy → openblas, opencv → libGL, cuda packages, etc.
   nixLdLibraries = with pkgs; [
-    zlib zstd stdenv.cc.cc.lib curl openssl attr libssh bzip2
-    libxml2 acl libsodium util-linux xz systemd
+    zlib
+    zstd
+    stdenv.cc.cc.lib
+    curl
+    openssl
+    attr
+    libssh
+    bzip2
+    libxml2
+    acl
+    libsodium
+    util-linux
+    xz
+    systemd
     z3
   ];
 
@@ -52,12 +121,17 @@ let
       loaderBasename = baseNameOf pkgs.stdenv.cc.bintools.dynamicLinker;
       loaderDir = if pkgs.stdenv.hostPlatform.isx86_64 then "/lib64" else "/lib";
     in
-      "${loaderDir}/${loaderBasename}";
+    "${loaderDir}/${loaderBasename}";
 
-in pkgs.dockerTools.buildLayeredImage {
+in
+pkgs.dockerTools.buildLayeredImage {
   name = "agent";
 
-  contents = [ env pkgs.dockerTools.binSh pkgs.dockerTools.usrBinEnv ];
+  contents = [
+    env
+    pkgs.dockerTools.binSh
+    pkgs.dockerTools.usrBinEnv
+  ];
 
   fakeRootCommands = ''
     cp -r ${./root/etc}/. etc/
@@ -79,7 +153,10 @@ in pkgs.dockerTools.buildLayeredImage {
   '';
 
   config = {
-    Cmd = [ "claude" "--dangerously-skip-permissions" ];
+    Cmd = [
+      "claude"
+      "--dangerously-skip-permissions"
+    ];
     User = "agent";
     Env = [
       "HOME=/home/agent"
