@@ -67,7 +67,7 @@ let
       starship
       sudo
       texlab
-      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf csquotes urlbst amsmath thmtools mathtools marginnote cleveref minted; })
+      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf csquotes urlbst upquote amsmath thmtools mathtools marginnote cleveref minted; })
       julia-mono
       time
       tmux
