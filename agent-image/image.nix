@@ -59,7 +59,7 @@ let
       openssh
       poppler-utils
       procps
-      python3
+      (python3.withPackages (ps: [ ps.pygments ]))
       ripgrep
       ruff
       shellcheck
@@ -67,7 +67,8 @@ let
       starship
       sudo
       texlab
-      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf csquotes amsmath amsthm thmtools mathtools marginnote cleveref; })
+      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf csquotes urlbst amsmath thmtools mathtools marginnote cleveref minted; })
+      julia-mono
       time
       tmux
       ty
@@ -88,6 +89,7 @@ let
       "/share/git-core"
       "/share/git"
       "/share/man"
+      "/share/fonts"
     ];
   };
 
