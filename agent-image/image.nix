@@ -177,6 +177,7 @@ pkgs.dockerTools.buildLayeredImage {
       "XDG_DATA_HOME=/home/agent/.local/share"
       "XDG_STATE_HOME=/home/agent/.local/state"
       "XDG_CACHE_HOME=/home/agent/.cache"
+      "OSFONTDIR=${env}/share/fonts"
       "NIX_CONFIG=experimental-features = nix-command flakes"
       "NIX_LD=${pkgs.stdenv.cc.bintools.dynamicLinker}"
       "NIX_LD_LIBRARY_PATH=${lib.makeLibraryPath nixLdLibraries}"
