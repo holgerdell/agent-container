@@ -26,6 +26,7 @@ let
       bun
       bzip2
       cacert
+      clang
       claude-code-pkg
       coreutils
       curl
@@ -66,6 +67,7 @@ let
       starship
       sudo
       texlab
+      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf; })
       time
       tmux
       ty
