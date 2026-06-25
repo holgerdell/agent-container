@@ -67,7 +67,7 @@ let
       starship
       sudo
       texlab
-      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf; })
+      (texlive.combine { inherit (texlive) scheme-medium latexmk pgf csquotes amsmath amsthm thmtools mathtools marginnote cleveref; })
       time
       tmux
       ty
