@@ -7,6 +7,47 @@
 let
   lib = pkgs.lib;
 
+  leanVersion = "4.31.0";
+  # Upstream tarball names: lean-4.31.0-linux.tar.zst (x86_64), lean-4.31.0-linux_aarch64.tar.zst
+  leanArchSuffix = if pkgs.stdenv.hostPlatform.isx86_64 then "" else "_aarch64";
+
+  # Lean 4 toolchain fetched into the nix store and auto-patched at image build time.
+  # Being in the store makes glibc/libstdc++ runtime deps proper GC roots — the
+  # root cause of the previous breakage (patched ELFs in mutable ~/.elan, depending
+  # on store paths that GC was free to collect). autoPatchelfHook resolves every
+  # DT_NEEDED against buildInputs, handles PIE binaries correctly, and errors loudly
+  # on any missing lib rather than silently leaving broken ELFs.
+  lean4Toolchain = pkgs.stdenv.mkDerivation {
+    pname = "lean4-toolchain";
+    version = leanVersion;
+
+    src = pkgs.fetchurl {
+      url = "https://github.com/leanprover/lean4/releases/download/v${leanVersion}/lean-${leanVersion}-linux${leanArchSuffix}.tar.zst";
+      hash =
+        if pkgs.stdenv.hostPlatform.isx86_64 then
+          "sha256-B6YzzI2RUcvAiCXqTN2lDUsCosnLhSwBMbEwRvScrX8="
+        else
+          "sha256-sb8dPFhrds9KhiEqWV2Lnt2Z9DikHM6F1XgPqTR8gRs=";
+    };
+
+    nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.zstd ];
+    buildInputs = with pkgs; [
+      stdenv.cc.cc.lib
+      gmp
+      libuv
+      zlib
+    ];
+
+    sourceRoot = "lean-${leanVersion}-linux${leanArchSuffix}";
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      cp -a . $out
+      runHook postInstall
+    '';
+  };
+
   passwd = pkgs.writeText "passwd" ''
     root:x:0:0:root:/root:/bin/sh
     agent:x:${toString uid}:${toString gid}:agent:/home/agent:/bin/bash
@@ -52,6 +93,7 @@ let
       man-db
       mypy
       nano
+      nauty
       neovim
       nix
       nodejs
@@ -133,6 +175,7 @@ pkgs.dockerTools.buildLayeredImage {
 
   contents = [
     env
+    lean4Toolchain
     pkgs.dockerTools.binSh
     pkgs.dockerTools.usrBinEnv
   ];
@@ -144,6 +187,14 @@ pkgs.dockerTools.buildLayeredImage {
 
     mkdir -p home/agent tmp
     mkdir -p nix/var/nix/profiles/per-user/agent
+
+    # Pre-install Lean 4 toolchain into the store-backed elan directory.
+    # ${lean4Toolchain}/bin is on PATH as fallback; elan shims in ~/.elan/bin are
+    # not pre-created, so per-project toolchain switching requires running
+    # `elan default leanprover/lean4:v4.31.0` once to populate the shims.
+    mkdir -p home/agent/.elan/toolchains
+    ln -s ${lean4Toolchain} home/agent/.elan/toolchains/leanprover--lean4---v4.31.0
+    printf 'telemetry = false\nversion = "12"\ndefault_toolchain = "leanprover/lean4:v4.31.0"\n' > home/agent/.elan/settings.toml
     # nix-ld: place the shim at the FHS loader path so unpatched ELFs (e.g.
     # manylinux wheels installed by uv) resolve their interpreter to a shim
     # that honors NIX_LD and NIX_LD_LIBRARY_PATH instead of failing to find
@@ -164,7 +215,7 @@ pkgs.dockerTools.buildLayeredImage {
     User = "agent";
     Env = [
       "HOME=/home/agent"
-      "PATH=${env}/bin:/home/agent/.local/bin:/home/agent/.elan/bin"
+      "PATH=${lean4Toolchain}/bin:${env}/bin:/home/agent/.local/bin:/home/agent/.elan/bin"
       "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       "EDITOR=nvim"
       "VISUAL=nvim"
