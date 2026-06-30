@@ -81,6 +81,7 @@ let
       gh
       git
       gnupg
+      gnugrep
       gnused
       gnutar
       gzip
