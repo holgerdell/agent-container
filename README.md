@@ -37,6 +37,7 @@ agent              # run claude in the current directory
 agent shell        # open bash instead
 agent setup        # configure container engine, workspace sharing, read-only host mounts
 agent build        # build the image and exit
+agent update       # update flake.lock and commit the change
 agent check        # validate Nix expression without building
 agent doctor       # run environment health checks
 agent clean        # remove container image and Nix store cache

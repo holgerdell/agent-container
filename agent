@@ -312,12 +312,13 @@ to claude (or to bash with `shell`).
 {_bold("Options:")}
   {_bold("--help")}                  Show this help message and exit
   {_bold("--mount-mode")} MODE       Override workspace mount mode (repo_root|pwd)
+                          (also accepts {_bold("--mount-mode=MODE")})
 
 {_bold("Subcommands:")}
   {_bold("setup")}    Configure agent (interactive)
   {_bold("shell")}    Open a bash shell instead of running claude
   {_bold("build")}    Build the container image (via Nix) and exit
-  {_bold("update")}   Update flake.lock (pin inputs to latest) and exit
+  {_bold("update")}   Update flake.lock (pin inputs to latest); commits the change and exits
   {_bold("clean")}    Remove the container image and Nix store cache
   {_bold("check")}    Validate the Nix expression without building
   {_bold("doctor")}   Run environment health checks
@@ -628,7 +629,7 @@ def run_doctor(engine: str, image: str) -> None:
     if raw is None:
         _doctor_warn(
             "NOFILE limit",
-            f"{_sty('2', 'skipped — run `agent build` first to check inside the real container')}",
+            _sty("2", "skipped — run `agent build` first to check inside the real container"),
             label_w,
         )
         print()
@@ -938,10 +939,19 @@ def build(engine: str, image: str) -> None:
     )
     build_proc.stdout.close()
     build_rc = build_proc.wait()
+    if load.returncode != 0:
+        # A truncated/corrupted stream shows up here first (e.g. unpigz:
+        # "corrupted -- incomplete deflate data"). The usual cause is a bad
+        # cached tarball in the build volume, which survives a plain retry —
+        # the fix is to drop the volume and rebuild from scratch.
+        recovery = f"{engine} volume rm {NIX_BUILD_CACHE_VOLUME} && agent build"
+        die(
+            f"{engine} load failed:\n{load.stderr.strip() or f'exit {load.returncode}'}\n"
+            f"If this looks like a corrupted or truncated stream, reset the build "
+            f"cache and retry:\n  {recovery}"
+        )
     if build_rc != 0:
         die(f"nix build failed (exit {build_rc})")
-    if load.returncode != 0:
-        die(f"{engine} load failed:\n{load.stderr}")
     # podman prefixes loaded images with `localhost/`; docker does not.
     m = re.search(r"(?:localhost/)?agent:[a-z0-9]+", load.stdout)
     if m is None:
