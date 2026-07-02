@@ -188,6 +188,8 @@ pkgs.dockerTools.buildLayeredImage {
 
     mkdir -p home/agent tmp
     mkdir -p nix/var/nix/profiles/per-user/agent
+    mkdir -p usr/bin
+    ln -s ${pkgs.time}/bin/time usr/bin/time
 
     # Pre-install Lean 4 toolchain into the store-backed elan directory.
     # ${lean4Toolchain}/bin is on PATH as fallback; elan shims in ~/.elan/bin are
