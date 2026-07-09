@@ -38,7 +38,6 @@ SHARED_HOST_PATHS_ALLOWLIST: list[tuple[str, str, str]] = [
     ("~/.claude/agents/", "/home/agent/.claude/agents/", "custom subagents"),
     ("~/.claude/commands/", "/home/agent/.claude/commands/", "custom slash commands"),
     ("~/.agents/", "/home/agent/.agents/", "shared agent data"),
-    ("~/.config/gh/", "/home/agent/.config/gh/", "GitHub CLI auth"),
     ("~/.gitconfig", "/home/agent/.gitconfig", "git user config"),
     ("~/.config/git/", "/home/agent/.config/git/", "git XDG config"),
 ]

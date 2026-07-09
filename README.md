@@ -10,7 +10,7 @@ Yet another script for running a coding agent in an isolated container. Here's w
 
 - 🐳 Runs the agent inside an isolated container
 - 📁 Only the current workspace is mounted into the container
-- 🔒 Selected config files (`~/.gitconfig`, `~/.config/gh/`, etc.) can optionally be mounted read-only
+- 🔒 Selected config files (`~/.gitconfig`, etc.) can optionally be mounted read-only
 - 🗂️ The container's home directory is persisted in an isolated location (`~/.local/share/agent-container/home/`)
 - ❄️ The container uses Nix instead of a Dockerfile, which makes it easy to customize to your needs
 
@@ -51,7 +51,7 @@ agent -- --print "hello"
 agent shell -- -c 'echo hi'
 ```
 
-`agent setup` configures the container engine, workspace root (current directory or git repo root), and read-only host mounts (`~/.gitconfig`, `~/.config/gh/`, `~/.claude/`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
+`agent setup` configures the container engine, workspace root (current directory or git repo root), and read-only host mounts (`~/.gitconfig`, `~/.claude/`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
 
 The agent's home directory (`~/.local/share/agent-container/home/`) and Nix store (per-image volume) are persisted across runs. Old Nix volumes accumulate until `agent clean`.
 
