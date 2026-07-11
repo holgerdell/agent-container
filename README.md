@@ -53,7 +53,7 @@ agent shell -- -c 'echo hi'
 
 `agent setup` configures the container engine, workspace root (current directory or git repo root), and read-only host mounts (`~/.gitconfig`, `~/.claude/`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
 
-The agent's home directory (`~/.local/share/agent-container/home/`) and Nix store (per-image volume) are persisted across runs. Old Nix volumes accumulate until `agent clean`.
+The agent's home directory is persisted across runs in a named volume. The Nix store is not persisted at runtime — the container uses the image's built-in `/nix` directly, so no volume is seeded on startup.
 
 ## MacOS and Podman
 

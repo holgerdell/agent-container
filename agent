@@ -19,7 +19,6 @@ SharedHostPath = str | dict[str, str]
 
 NIX_IMAGE = "docker.io/nixos/nix:latest"
 NIX_BUILD_CACHE_VOLUME = "agent-nix-store"
-RUNTIME_NIX_VOLUME_PREFIX = "agent-container-nix-"
 HOME_VOLUME_PREFIX = "agent-home-"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -714,9 +713,9 @@ def check_engine(engine: str) -> None:
         if not running:
             die("no running podman machine\nRemediation: podman machine start")
 
-    r = _run_quiet([engine, "info"])
-    if r.returncode != 0:
-        stderr = r.stderr.decode(errors="replace").strip()
+    info = _run_quiet([engine, "info"])
+    if info.returncode != 0:
+        stderr = info.stderr.decode(errors="replace").strip()
         die(f"`{engine} info` failed:\n{stderr}")
 
 
@@ -726,29 +725,6 @@ def image_exists(engine: str, image: str) -> bool:
     else:
         cmd = ["docker", "image", "inspect", image]
     return _run_quiet(cmd).returncode == 0
-
-
-def runtime_nix_volume_name(image_id: str) -> str:
-    # Keyed by image content so each build gets its own /nix volume.
-    # Lets concurrent agents on different builds keep working — old container
-    # holds its image+volume, new run gets a fresh pair. Stale volumes from
-    # prior builds accumulate until `agent clean`.
-    short = image_id.removeprefix("sha256:")[:12]
-    if not short:
-        die(f"unexpected empty image id: {image_id!r}")
-    return f"{RUNTIME_NIX_VOLUME_PREFIX}{short}"
-
-
-def inspect_image_id(engine: str, image: str) -> str:
-    r = subprocess.run(
-        [engine, "inspect", "--format", "{{.Id}}", image],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if r.returncode != 0:
-        die(f"could not inspect {image}:\n{r.stderr.strip() or f'exit {r.returncode}'}")
-    return r.stdout.strip()
 
 
 def build_container_name(uid: int, gid: int) -> str:
@@ -789,8 +765,8 @@ def _clean_step(label: str, cmd: list[str], *, missing_ok: bool = False) -> None
     warn(f"{label} failed: {stderr or f'exit {r.returncode}'}")
 
 
-def _resources_in_use(engine: str) -> tuple[set[str], set[str]]:
-    """Return (short_image_ids, volume_names) currently in use by running containers."""
+def _images_in_use(engine: str) -> set[str]:
+    """Return short image ids currently in use by running containers."""
     r = subprocess.run(
         [engine, "ps", "-aq", "--no-trunc"],
         capture_output=True,
@@ -798,7 +774,7 @@ def _resources_in_use(engine: str) -> tuple[set[str], set[str]]:
         check=False,
     )
     if r.returncode != 0 or not r.stdout.strip():
-        return set(), set()
+        return set()
     container_ids = [c.strip() for c in r.stdout.splitlines() if c.strip()]
     ri = subprocess.run(
         [engine, "inspect", "--format", "{{.Image}}", *container_ids],
@@ -812,23 +788,11 @@ def _resources_in_use(engine: str) -> tuple[set[str], set[str]]:
             raw = raw.strip()
             if raw:
                 image_ids.add(raw.removeprefix("sha256:")[:12])
-    rv = subprocess.run(
-        [engine, "inspect", "--format", "{{range .Mounts}}{{if .Name}}{{.Name}}\n{{end}}{{end}}", *container_ids],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    vol_names: set[str] = set()
-    if rv.returncode == 0:
-        for raw in rv.stdout.splitlines():
-            raw = raw.strip()
-            if raw:
-                vol_names.add(raw)
-    return image_ids, vol_names
+    return image_ids
 
 
 def run_clean(engine: str) -> None:
-    in_use_ids, in_use_vols = _resources_in_use(engine)
+    in_use_ids = _images_in_use(engine)
 
     print(f"{_sty('1;34', '→')} Inspecting agent images...")
     r = subprocess.run(
@@ -857,28 +821,6 @@ def run_clean(engine: str) -> None:
         _clean_step("Removing agent images", [engine, "rmi", *tags], missing_ok=True)
     else:
         print(f"{_sty('2', '•')} Removing agent images: nothing to do.")
-
-    print(f"{_sty('1;34', '→')} Inspecting runtime nix volumes...")
-    r = subprocess.run(
-        [engine, "volume", "ls", "--filter", f"name={RUNTIME_NIX_VOLUME_PREFIX}", "--format", "{{.Name}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    all_vols = [v.strip() for v in r.stdout.splitlines() if v.strip()]
-    skipped_vols = [v for v in all_vols if v in in_use_vols]
-    vols = [v for v in all_vols if v not in in_use_vols]
-    if skipped_vols:
-        print(f"{_sty('2', '•')} Skipping in-use volumes: {', '.join(skipped_vols)}")
-    if vols:
-        print(f"{_sty('2', '•')} Found runtime volumes: {', '.join(vols)}")
-        _clean_step(
-            f"Removing {len(vols)} runtime nix volume(s)",
-            [engine, "volume", "rm", *vols],
-            missing_ok=True,
-        )
-    else:
-        print(f"{_sty('2', '•')} Removing runtime nix volumes: nothing to do.")
 
     print(f"{_sty('1;32', '✓')} Clean finished.")
 
@@ -1099,15 +1041,14 @@ def main() -> None:
         mount_root = cwd
 
     uid, gid = os.getuid(), os.getgid()
-    runtime_nix_volume = runtime_nix_volume_name(inspect_image_id(engine, image))
-    # Do NOT pre-create the volume here. Docker only seeds a named volume from
-    # image content when Docker itself creates it during `docker run`. If the
-    # volume already exists (even empty), Docker skips seeding and mounts an
-    # empty /nix, making all Nix-store executables unreachable.
-    # Same principle applies to the home volume: Docker seeds it from image
-    # content on first creation. Home on a named volume (not a bind mount)
-    # keeps all of ~/.elan, ~/.cache, ~/.local etc on native container fs,
-    # avoiding FUSE/VirtioFS open-file limits (~14K cap vs ~25K+ for Lean builds).
+    # /nix is not volume-mounted: the container uses the image's built-in
+    # /nix layer directly, so no seed-copy is needed on first run per image.
+    # Nix store writes during a session (e.g. `nix build`) don't persist
+    # across `--rm` runs.
+    # The home volume is still separate: Docker seeds it from image content
+    # on first creation. Home on a named volume (not a bind mount) keeps all
+    # of ~/.elan, ~/.cache, ~/.local etc on native container fs, avoiding
+    # FUSE/VirtioFS open-file limits (~14K cap vs ~25K+ for Lean builds).
     home_volume = f"{HOME_VOLUME_PREFIX}u{uid}g{gid}"
 
     xdg_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
@@ -1169,8 +1110,6 @@ def main() -> None:
     base += [
         "--memory-swap=-1",
         "--ulimit", "nofile=524288:524288",
-        "-v",
-        f"{runtime_nix_volume}:/nix",
         *mount_flags,
         *env_flags,
         "-w",
