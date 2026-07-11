@@ -173,6 +173,10 @@ let
 in
 pkgs.dockerTools.buildLayeredImage {
   name = "agent";
+  # zstd over the default gzip: the tarball is only ever streamed to a local
+  # `docker load`, so compression is pure CPU tax on both ends — zstd
+  # decompresses several times faster, cutting cold-build load time.
+  compressor = "zstd";
 
   contents = [
     env
