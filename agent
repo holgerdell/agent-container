@@ -845,6 +845,37 @@ def build(engine: str, image: str) -> None:
     # Clear any stopped leftover (e.g. from a crash) so `--name` can claim it.
     _run_quiet([engine, "rm", build_name])
     _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
+
+    # Cheap pre-check: realize the image derivation and print its store path
+    # (seconds when the tarball is already cached, vs ~70s to stream and load
+    # the multi-GB tarball). The store-path hash keys a marker tag
+    # `agent:src-<hash>`; if that marker exists we've already loaded this exact
+    # tarball, so we can skip `docker load` and just re-tag. Kept under the
+    # `agent` repo so `agent clean`'s sweep removes markers too.
+    print(f"{_sty('1;34', '→')} Resolving image...")
+    probe = subprocess.run(
+        [
+            engine, "run", "--rm", "--name", build_name,
+            "-v", f"{NIX_BUILD_CACHE_VOLUME}:/nix",
+            "-v", f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z",
+            NIX_IMAGE, "sh", "-c",
+            "nix build path:/build#image --no-link --print-out-paths"
+            " --impure --extra-experimental-features 'nix-command flakes'",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if probe.returncode != 0:
+        die(f"nix build failed (exit {probe.returncode}):\n{probe.stderr.strip() or '(no output)'}")
+    out_path = probe.stdout.strip().splitlines()[-1] if probe.stdout.strip() else ""
+    sm = re.match(r"/nix/store/([a-z0-9]+)-", out_path)
+    if sm is None:
+        die(f"could not parse nix store path from build output:\n{out_path or '(empty)'}")
+    marker = f"agent:src-{sm.group(1)}"
+    if image_exists(engine, marker):
+        subprocess.run([engine, "tag", marker, image], check=True)
+        print(f"{_sty('1;32', '✓')} Reused {marker}; tagged as {image}")
+        return
+
     print(f"{_sty('1;34', '→')} Building...")
     build_proc = subprocess.Popen(
         [
@@ -898,6 +929,7 @@ def build(engine: str, image: str) -> None:
     if m is None:
         die(f"could not extract image tag from `{engine} load` output:\n{load.stdout.strip() or '(empty)'}")
     subprocess.run([engine, "tag", m.group(0), image], check=True)
+    subprocess.run([engine, "tag", m.group(0), marker], check=True)
     print(f"{_sty('1;32', '✓')} Tagged {m.group(0)} as {image}")
     # No volume removal: runtime volume name is derived from image ID at
     # `agent run`, so the new image gets its own fresh volume on first use.
