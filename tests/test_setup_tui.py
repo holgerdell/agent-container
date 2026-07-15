@@ -126,20 +126,19 @@ class SetupTUITests(unittest.TestCase):
         return data
 
     def test_arrow_keys_navigate_select(self) -> None:
-        # Accept default engine; default mount cursor is repo_root, UP → pwd.
+        # Default mount cursor is repo_root, UP → pwd.
         code, _ = _drive(
-            [KEY_ENTER, KEY_UP, KEY_ENTER, KEY_ENTER],
+            [KEY_UP, KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
         saved = self._saved()
-        self.assertEqual(saved["container_engine"], "docker")
         self.assertEqual(saved["mount_mode"], "pwd")
         self.assertEqual(saved["shared_host_paths"], [])
 
     def test_vim_keys_navigate_select(self) -> None:
         code, _ = _drive(
-            [KEY_ENTER, b"j", KEY_ENTER, KEY_ENTER],
+            [b"j", KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
@@ -147,24 +146,15 @@ class SetupTUITests(unittest.TestCase):
 
     def test_default_mount_when_no_navigation(self) -> None:
         code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
+            [KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
         self.assertEqual(self._saved()["mount_mode"], "repo_root")
 
-    def test_engine_selection_saves_podman(self) -> None:
-        # Default cursor is docker; DOWN → podman.
-        code, _ = _drive(
-            [KEY_DOWN, KEY_ENTER, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(self._saved()["container_engine"], "podman")
-
     def test_checkbox_toggles_two_entries(self) -> None:
         code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
+            [KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
@@ -181,19 +171,17 @@ class SetupTUITests(unittest.TestCase):
         self.settings.write_text(
             json.dumps(
                 {
-                    "container_engine": "docker",
                     "mount_mode": "pwd",
                     "shared_host_paths": ["~/.claude/skills/"],
                 },
             ),
         )
         code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
+            [KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
         saved = self._saved()
-        self.assertEqual(saved["container_engine"], "docker")
         self.assertEqual(saved["mount_mode"], "pwd")
         self.assertEqual(saved["shared_host_paths"], ["~/.claude/skills/"])
 
@@ -204,13 +192,12 @@ class SetupTUITests(unittest.TestCase):
         self.settings.write_text(
             json.dumps(
                 {
-                    "container_engine": "docker",
                     "mount_mode": "repo_root",
                     "shared_host_paths": [{"host": str(custom_host), "container": "/home/agent/custom-config"}],
                 }
             )
         )
-        code, _ = _drive([KEY_ENTER, KEY_ENTER, KEY_ENTER], home=self.home)
+        code, _ = _drive([KEY_ENTER, KEY_ENTER], home=self.home)
         self.assertEqual(code, 0)
         self.assertEqual(
             self._saved()["shared_host_paths"],
@@ -219,7 +206,7 @@ class SetupTUITests(unittest.TestCase):
 
     def test_narrow_terminal_does_not_crash(self) -> None:
         code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
+            [KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
             home=self.home,
             cols=40,
         )

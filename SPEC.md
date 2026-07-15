@@ -16,9 +16,9 @@ _Ideas below are just ideas, not yet spec:_
 - `.env` file passthrough (explicit allowlist of vars)
 - Version-pin Claude Code inside the image (lock-pinned by `agent-image/flake.lock`; bump with `nix flake update`)
 - Persistent bash history: bind-mount `$XDG_STATE_HOME/agent-container/bash_history` to `/home/agent/.bash_history` so shell history survives `--rm`
-- `agent doctor` subcommand: diagnose podman machine state, memory, volume health, host config visibility
+- `agent doctor` subcommand: diagnose engine state, memory, volume health, host config visibility
 - Per-project image overlay: if `.agent/extra.nix` exists in project root, rebuild with those extra packages layered onto the base set
 - Pull prebuilt image fallback: optional `AGENT_IMAGE_PULL=ghcr.io/...` to skip first-run Nix build
-- Container name per project: name containers based on `$PWD` hash so `podman ps` / `docker ps` is readable and concurrent sessions are distinguishable
+- Container name per project: name containers based on `$PWD` hash so `docker ps` is readable and concurrent sessions are distinguishable
 - Support multiple agent backends (Claude Code default; opencode, etc. as opt-in modules)
 - Optionally support connection pass-through to IDE on host
