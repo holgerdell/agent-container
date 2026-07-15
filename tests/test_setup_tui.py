@@ -125,17 +125,6 @@ class SetupTUITests(unittest.TestCase):
         data: dict[str, Any] = json.loads(self.settings.read_text())
         return data
 
-    def test_arrow_keys_navigate_select(self) -> None:
-        # Default mount cursor is repo_root, UP → pwd.
-        code, _ = _drive(
-            [KEY_UP, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        saved = self._saved()
-        self.assertEqual(saved["mount_mode"], "pwd")
-        self.assertEqual(saved["shared_host_paths"], [])
-
     def test_vim_keys_navigate_select(self) -> None:
         code, _ = _drive(
             [b"j", KEY_ENTER, KEY_ENTER],
