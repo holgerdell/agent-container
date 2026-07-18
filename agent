@@ -658,11 +658,12 @@ def _check_run_container(engine: str, image: str, settings: Settings) -> DoctorC
     fresh = stored_fp == build_run_spec(engine, settings, image, mount_root).fingerprint
     if fresh:
         return DoctorCheck("ok", "container", f"{run_state}, up to date", detail=name)
-    # Self-healing (auto-recreates), so info/cyan — not a yellow "you must act".
-    return DoctorCheck(
-        "info", "container", f"{run_state}, config changed", detail=name,
-        note="rebuilds on next call",
-    )
+    # Self-healing (auto-recreates when safe), so info/cyan — not a yellow "you must act".
+    if running:
+        note = "session active; next call joins it instead of rebuilding"
+    else:
+        note = "rebuilds on next call"
+    return DoctorCheck("info", "container", f"{run_state}, config changed", detail=name, note=note)
 
 
 def _check_pileup(engine: str) -> DoctorCheck | None:
@@ -913,9 +914,19 @@ def ensure_run_container(engine: str, spec: RunSpec) -> None:
     if state is None:
         create_run_container(engine, spec)
     elif state[1] != spec.fingerprint:
-        # Stale config or rebuilt image → tear down and recreate.
-        _run_quiet([engine, "rm", "-f", spec.name])
-        create_run_container(engine, spec)
+        if state[0]:
+            # Stale config (e.g. after `agent update`), but a session is still
+            # running in it — recreating would kill that session. Join the old
+            # container instead; it picks up the new config once stopped.
+            warn(
+                f"{spec.name} config changed but a session is still running; "
+                f"joining the existing (outdated) container instead of rebuilding. "
+                f"Run `agent stop` once no session is active to pick up the new config."
+            )
+        else:
+            # Stopped and stale → safe to tear down and recreate.
+            _run_quiet([engine, "rm", "-f", spec.name])
+            create_run_container(engine, spec)
     elif not state[0]:
         # Stopped but matching → fast restart (the point of persistence).
         _run_quiet([engine, "start", spec.name])
