@@ -37,11 +37,12 @@ agent              # run claude in the current directory
 agent shell        # open bash instead
 agent setup        # configure workspace sharing, read-only host mounts
 agent stop         # remove this repo's persistent container (--all for every repo)
-agent build        # build the image and exit
-agent update       # update flake.lock and commit the change
+agent build        # build the seed image and exit (rare; bumps go through update)
+agent update       # upgrade the toolchain in place: bump flake.lock, build, swap
 agent check        # validate Nix expression without building
 agent doctor       # run environment health checks
-agent clean        # remove container image and Nix store cache
+agent clean        # session-respecting reclaim (--force also kills live sessions)
+agent reset        # delete the shared /nix volume and reseed from the image
 agent help         # show help
 ```
 
@@ -54,7 +55,7 @@ agent shell -- -c 'echo hi'
 
 `agent setup` configures the workspace root (current directory or git repo root) and read-only host mounts (`~/.gitconfig`, `~/.claude/`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
 
-The agent's home directory is persisted across runs in a named volume. The Nix store is not persisted at runtime — the container uses the image's built-in `/nix` directly, so no volume is seeded on startup.
+The agent's home directory is persisted across runs in a named volume. The Nix store is a **persistent, writeable, per-user volume** shared across all your repos, seeded once from the image's baked `/nix` on first run. `agent update` upgrades the toolchain *in place* — it builds the new toolchain straight into the shared store and atomically swaps the Nix profile, so a new shell picks it up with no image rebuild and no container restart. `agent clean` reclaims old toolchain generations while protecting any that a live session is still using; `agent reset` deletes the shared volume and reseeds from scratch.
 
 ## File descriptor limits
 

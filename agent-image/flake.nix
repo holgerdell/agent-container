@@ -33,6 +33,18 @@
         in
         if v == "" then default else nixpkgs.lib.toInt v;
 
+      # `.#toolchain` is pure and uid-agnostic: the same store path serves every
+      # user, so all per-user /nix volumes seed and upgrade from one closure.
+      mkToolchain =
+        system:
+        (import ./toolchain.nix {
+          pkgs = nixpkgs.legacyPackages.${system};
+          claude-code-pkg = claude-code.packages.${system}.claude-code;
+        }).toolchain;
+
+      # `.#image` carries the uid (passwd/group, home chown, per-user profile
+      # dir), so it stays impure. It installs the toolchain as generation 1 of
+      # the default profile.
       mkImage =
         system:
         import ./image.nix {
@@ -44,6 +56,7 @@
     in
     {
       packages = forAllSystems (system: {
+        toolchain = mkToolchain system;
         image = mkImage system;
         default = mkImage system;
       });

@@ -7,46 +7,11 @@
 let
   lib = pkgs.lib;
 
-  leanVersion = "4.31.0";
-  # Upstream tarball names: lean-4.31.0-linux.tar.zst (x86_64), lean-4.31.0-linux_aarch64.tar.zst
-  leanArchSuffix = if pkgs.stdenv.hostPlatform.isx86_64 then "" else "_aarch64";
+  tc = import ./toolchain.nix { inherit pkgs claude-code-pkg; };
+  toolchain = tc.toolchain;
 
-  # Lean 4 toolchain fetched into the nix store and auto-patched at image build time.
-  # Being in the store makes glibc/libstdc++ runtime deps proper GC roots — the
-  # root cause of the previous breakage (patched ELFs in mutable ~/.elan, depending
-  # on store paths that GC was free to collect). autoPatchelfHook resolves every
-  # DT_NEEDED against buildInputs, handles PIE binaries correctly, and errors loudly
-  # on any missing lib rather than silently leaving broken ELFs.
-  lean4Toolchain = pkgs.stdenv.mkDerivation {
-    pname = "lean4-toolchain";
-    version = leanVersion;
-
-    src = pkgs.fetchurl {
-      url = "https://github.com/leanprover/lean4/releases/download/v${leanVersion}/lean-${leanVersion}-linux${leanArchSuffix}.tar.zst";
-      hash =
-        if pkgs.stdenv.hostPlatform.isx86_64 then
-          "sha256-B6YzzI2RUcvAiCXqTN2lDUsCosnLhSwBMbEwRvScrX8="
-        else
-          "sha256-sb8dPFhrds9KhiEqWV2Lnt2Z9DikHM6F1XgPqTR8gRs=";
-    };
-
-    nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.zstd ];
-    buildInputs = with pkgs; [
-      stdenv.cc.cc.lib
-      gmp
-      libuv
-      zlib
-    ];
-
-    sourceRoot = "lean-${leanVersion}-linux${leanArchSuffix}";
-
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out
-      cp -a . $out
-      runHook postInstall
-    '';
-  };
+  # Basename of the FHS loader (e.g. ld-linux-x86-64.so.2), reused for NIX_LD.
+  loaderBasename = baseNameOf tc.fhsDynamicLinker;
 
   passwd = pkgs.writeText "passwd" ''
     root:x:0:0:root:/root:/bin/sh
@@ -60,116 +25,24 @@ let
     nobody:x:65534:
   '';
 
-  env = pkgs.buildEnv {
-    name = "agent-env";
-    paths = with pkgs; [
-      bashInteractive
-      bun
-      bzip2
-      cacert
-      clang
-      claude-code-pkg
-      coreutils
-      curl
-      delta
-      diffutils
-      elan
-      findutils
-      fzf
-      gawk
-      gcc
-      gh
-      git
-      gnupg
-      gnugrep
-      gnused
-      gnutar
-      gzip
-      htop
-      hyperfine
-      jq
-      just
-      katex
-      less
-      man-db
-      mypy
-      nano
-      nauty
-      neovim
-      nix
-      nodejs
-      opencode
-      openssh
-      poppler-utils
-      procps
-      (python3.withPackages (ps: [ ps.pygments ]))
-      ripgrep
-      ruff
-      shellcheck
-      shfmt
-      starship
-      sudo
-      texlab
-      (texliveMedium.withPackages (ps: with ps; [ latexmk pgf csquotes urlbst upquote amsmath thmtools mathtools marginnote cleveref minted ]))
-      julia-mono
-      time
-      tmux
-      ty
-      typos
-      typst
-      uv
-      unzip
-      which
-      xz
-      zip
-      zstd
-    ];
-    ignoreCollisions = true;
-    pathsToLink = [
-      "/bin"
-      "/lib"
-      "/etc"
-      "/share/git-core"
-      "/share/git"
-      "/share/man"
-      "/share/fonts"
-    ];
-  };
-
-  # Libraries exposed to unpatched ELF binaries (e.g. pip/uv wheels) via nix-ld.
-  # Mirrors the default set baked into the NixOS `programs.nix-ld` module
-  # (nixos/modules/programs/nix-ld.nix). Extend for heavier wheels:
-  # torch/scipy → openblas, opencv → libGL, cuda packages, etc.
-  nixLdLibraries = with pkgs; [
-    zlib
-    zstd
-    stdenv.cc.cc.lib
-    curl
-    openssl
-    attr
-    libssh
-    bzip2
-    libxml2
-    acl
-    libsodium
-    util-linux
-    xz
-    systemd
-    z3
-  ];
-
-  # FHS path where unpatched ELF binaries expect to find the dynamic loader.
-  # Derived from the real glibc loader's basename so it matches whatever
-  # manylinux wheels were built against. Older nixpkgs channels lack
-  # `hostPlatform.dynamicLinker`, so we compute it from `bintools.dynamicLinker`
-  # (a Nix store path) plus the FHS directory convention per arch.
-  fhsDynamicLinker =
-    let
-      loaderBasename = baseNameOf pkgs.stdenv.cc.bintools.dynamicLinker;
-      loaderDir = if pkgs.stdenv.hostPlatform.isx86_64 then "/lib64" else "/lib";
-    in
-    "${loaderDir}/${loaderBasename}";
-
+  # Register the Nix database for the toolchain closure so the seeded store is
+  # *operable*: the root tooling can `nix-env --profile … --set` (upgrade) and
+  # `nix-collect-garbage` (clean) against it. This replicates dockerTools'
+  # `mkDbExtraCommand` rather than using `buildLayeredImageWithNixDb`, because
+  # that builder registers the closure of `contents` — but `contents` must be
+  # *empty* here (see below), so we root the DB at the toolchain explicitly. The
+  # payoff: the toolchain is never symlinked into the rootfs, so every surviving
+  # root-fs symlink is profile-stable, per the broken-symlink guard.
+  registerDb = ''
+    echo "Registering the Nix database for the toolchain closure..."
+    export NIX_REMOTE=local?root=$PWD
+    export USER=nobody
+    ${pkgs.buildPackages.nix}/bin/nix-store --load-db < ${
+      pkgs.closureInfo { rootPaths = [ toolchain ]; }
+    }/registration
+    ${pkgs.buildPackages.sqlite}/bin/sqlite3 nix/var/nix/db/db.sqlite \
+      "UPDATE ValidPaths SET registrationTime = ''${SOURCE_DATE_EPOCH}"
+  '';
 in
 pkgs.dockerTools.buildLayeredImage {
   name = "agent";
@@ -178,37 +51,49 @@ pkgs.dockerTools.buildLayeredImage {
   # decompresses several times faster, cutting cold-build load time.
   compressor = "zstd";
 
-  contents = [
-    env
-    lean4Toolchain
-    pkgs.dockerTools.binSh
-    pkgs.dockerTools.usrBinEnv
-  ];
+  # No `contents`: the toolchain is pulled into the image by the store-path
+  # references in `extraCommands`/`fakeRootCommands` below, so it is *not*
+  # symlinked into the rootfs. This keeps the rootfs free of seed-generation
+  # store paths — every baked symlink points at a profile-stable path that an
+  # in-place upgrade leaves valid.
+  extraCommands = registerDb;
 
   fakeRootCommands = ''
     cp -r ${./root/etc}/. etc/
     install -m 0644 ${passwd} etc/passwd
     install -m 0644 ${group} etc/group
 
-    mkdir -p home/agent tmp
+    mkdir -p home/agent tmp bin usr/bin
     mkdir -p nix/var/nix/profiles/per-user/agent
-    mkdir -p usr/bin
-    ln -s ${pkgs.time}/bin/time usr/bin/time
+    mkdir -p nix/var/nix/gcroots
 
-    # Pre-install Lean 4 toolchain into the store-backed elan directory.
-    # ${lean4Toolchain}/bin is on PATH as fallback; elan shims in ~/.elan/bin are
-    # not pre-created, so per-project toolchain switching requires running
-    # `elan default leanprover/lean4:v4.31.0` once to populate the shims.
-    mkdir -p home/agent/.elan/toolchains
-    ln -s ${lean4Toolchain} home/agent/.elan/toolchains/leanprover--lean4---v4.31.0
-    printf 'telemetry = false\nversion = "12"\ndefault_toolchain = "leanprover/lean4:v4.31.0"\n' > home/agent/.elan/settings.toml
+    # Generation 1 of the system default profile → the seed toolchain. Plain
+    # symlinks, not `nix-env` (no writable Nix DB under fakeroot); `agent
+    # update` adds generation 2+ via `nix-env --profile … --set` at runtime.
+    ln -s ${toolchain} nix/var/nix/profiles/default-1-link
+    ln -s default-1-link nix/var/nix/profiles/default
+    # Make the profiles dir a real GC root so nix-collect-garbage protects the
+    # current generation's whole closure just by it being the profile.
+    ln -s /nix/var/nix/profiles nix/var/nix/gcroots/profiles
+
+    # Root-filesystem symlinks — every target is a *profile-stable* path so it
+    # survives an in-place upgrade + GC (the broken-symlink guard). /bin/sh and
+    # /usr/bin/env replace dockerTools.binSh/usrBinEnv, which would bake
+    # seed-generation store paths that dangle once GC trims the seed toolchain.
+    ln -s /nix/var/nix/profiles/default/bin/bash bin/sh
+    ln -s /nix/var/nix/profiles/default/bin/env usr/bin/env
+    ln -s /nix/var/nix/profiles/default/bin/time usr/bin/time
     # nix-ld: place the shim at the FHS loader path so unpatched ELFs (e.g.
     # manylinux wheels installed by uv) resolve their interpreter to a shim
-    # that honors NIX_LD and NIX_LD_LIBRARY_PATH instead of failing to find
-    # /lib64/ld-linux-*.so. Nix-built binaries are unaffected — they carry
-    # their own RUNPATH and point at the real glibc loader in /nix/store.
-    mkdir -p .$(dirname ${fhsDynamicLinker})
-    ln -s ${pkgs.nix-ld}/libexec/nix-ld .${fhsDynamicLinker}
+    # that honors NIX_LD and NIX_LD_LIBRARY_PATH. Nix-built binaries are
+    # unaffected — they carry their own RUNPATH.
+    mkdir -p .$(dirname ${tc.fhsDynamicLinker})
+    ln -s /nix/var/nix/profiles/default/libexec/nix-ld .${tc.fhsDynamicLinker}
+
+    # Lean is not baked: the user manages it with elan. `elan` is on PATH and
+    # writes its shims to ~/.elan/bin (also on PATH); its downloaded toolchains
+    # are unpatched ELFs that run via nix-ld. Nothing to seed here.
+
     chmod 0777 tmp
     chown -R ${toString uid}:${toString gid} home/agent
     chown -R ${toString uid}:${toString gid} nix/var/nix/profiles/per-user/agent
@@ -220,10 +105,14 @@ pkgs.dockerTools.buildLayeredImage {
       "--dangerously-skip-permissions"
     ];
     User = "agent";
+    # Every store-referencing var points through the profile, not a fixed seed
+    # store path, so an in-place `agent update` (profile swap) upgrades the whole
+    # environment — not just PATH — with no container restart. A new shell
+    # resolves the profile symlink freshly and sees the new toolchain.
     Env = [
       "HOME=/home/agent"
-      "PATH=${lean4Toolchain}/bin:${env}/bin:/home/agent/.local/bin:/home/agent/.elan/bin"
-      "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+      "PATH=/nix/var/nix/profiles/default/bin:/home/agent/.local/bin:/home/agent/.elan/bin"
+      "SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt"
       "EDITOR=nvim"
       "VISUAL=nvim"
       "NPM_CONFIG_PREFIX=/home/agent/.local"
@@ -235,11 +124,11 @@ pkgs.dockerTools.buildLayeredImage {
       "XDG_DATA_HOME=/home/agent/.local/share"
       "XDG_STATE_HOME=/home/agent/.local/state"
       "XDG_CACHE_HOME=/home/agent/.cache"
-      "OSFONTDIR=${env}/share/fonts"
+      "OSFONTDIR=/nix/var/nix/profiles/default/share/fonts"
       "NIX_CONFIG=experimental-features = nix-command flakes"
-      "NIX_LD=${pkgs.stdenv.cc.bintools.dynamicLinker}"
-      "NIX_LD_LIBRARY_PATH=${lib.makeLibraryPath nixLdLibraries}"
-      "LD_LIBRARY_PATH=${lib.makeLibraryPath nixLdLibraries}"
+      "NIX_LD=/nix/var/nix/profiles/default/lib/${loaderBasename}"
+      "NIX_LD_LIBRARY_PATH=/nix/var/nix/profiles/default/lib"
+      "LD_LIBRARY_PATH=/nix/var/nix/profiles/default/lib"
     ];
   };
 }

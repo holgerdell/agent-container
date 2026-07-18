@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import contextlib
+import fcntl
+import getpass
 import hashlib
 import json
 import os
@@ -20,6 +22,23 @@ from typing import Any, NoReturn, TextIO
 ENGINE = "docker"
 NIX_IMAGE = "docker.io/nixos/nix:latest"
 NIX_BUILD_CACHE_VOLUME = "agent-nix-store"
+# The shared, persistent, writeable /nix volume — one per user (from `whoami`),
+# shared across all of that user's repos and stable across image rebuilds. It is
+# root-owned; the toolchain lives here as the default nix profile and is upgraded
+# in place by `agent update`. Distinct from NIX_BUILD_CACHE_VOLUME.
+NIX_SHARED_VOLUME_PREFIX = "agent-nix-"
+# Path of the root-owned system default profile inside the shared volume.
+PROFILES_DIR = "/nix/var/nix/profiles"
+DEFAULT_PROFILE = f"{PROFILES_DIR}/default"
+# Per-session gcroots the host writes so GC can't collect a generation a sibling
+# container is still using (each container has its own PID namespace, so Nix's
+# runtime-root scan can't see across them).
+SESSION_GCROOT_DIR = "/nix/var/nix/gcroots"
+SESSION_GCROOT_PREFIX = "session-"
+# Nix config for the transient *root* container that writes the shared store.
+# `build-users-group =` (empty) forces single-user builds as root — the agent
+# image has no `nixbld` build-user group, and root is the sole writer anyway.
+NIX_ROOT_CONFIG = "experimental-features = nix-command flakes\nbuild-users-group ="
 HOME_VOLUME_PREFIX = "agent-home-"
 RUN_CONTAINER_PREFIX = "agent-run-"
 # `agent doctor` shows the persistent-container count as informational; it only
@@ -41,6 +60,46 @@ SHARED_HOST_PATHS_ALLOWLIST: list[tuple[str, str, str]] = [
 
 def _allowlist_containers() -> dict[str, str]:
     return {host: container for host, container, _ in SHARED_HOST_PATHS_ALLOWLIST}
+
+
+# --- Shared /nix store lifecycle: pure logic (integration-verified callers) ---
+
+
+def nix_shared_volume(username: str) -> str:
+    """The per-user shared /nix volume name, keyed by `whoami`."""
+    return f"{NIX_SHARED_VOLUME_PREFIX}{username}"
+
+
+def parse_generation(profile_link_target: str) -> int | None:
+    """Parse N from a `default-N-link` profile-generation target (a bare link
+    name or a full path). None if it isn't a generation link."""
+    m = re.match(r"(?:.*/)?default-(\d+)-link$", profile_link_target.strip())
+    return int(m.group(1)) if m else None
+
+
+def generations_to_delete(all_gens: list[int], current: int, live_gens: list[int]) -> list[int]:
+    """Gentle-GC retention: keep the current generation and every generation
+    with number >= the oldest live session's recorded generation; delete the
+    rest. With no live session, keep only the current generation. (A long job
+    can span two upgrades and run on a generation that is neither its session's
+    start-generation nor the current one, so we keep the whole tail from the
+    oldest-live floor up.)"""
+    floor = min(live_gens) if live_gens else current
+    return sorted(g for g in all_gens if g < floor and g != current)
+
+
+def session_roots_to_reap(root_names: list[str], running: set[str]) -> list[str]:
+    """Session gcroots whose container is not currently running. Keying on
+    *not-running* (rather than *absent*) unifies clean-stop, crash-exit, and
+    removal — a stopped container has no live processes to protect, and a crash
+    can't leak a permanent root."""
+    reap: list[str] = []
+    for r in root_names:
+        if not r.startswith(SESSION_GCROOT_PREFIX):
+            continue
+        if r[len(SESSION_GCROOT_PREFIX) :] not in running:
+            reap.append(r)
+    return reap
 
 
 @dataclass(frozen=True)
@@ -361,17 +420,21 @@ to claude (or to bash with `shell`).
 {_bold("Subcommands:")}
   {_bold("setup")}    Configure agent (interactive)
   {_bold("shell")}    Open a bash shell instead of running claude
-  {_bold("build")}    Build the container image (via Nix) and exit
-  {_bold("update")}   Update flake.lock (pin inputs to latest); commits the change and exits
+  {_bold("build")}    Build the seed image (via Nix) and exit — rare; routine
+           toolchain bumps go through {_bold("update")}
+  {_bold("update")}   Upgrade the toolchain in place: bump flake.lock, build, and
+           swap the shared /nix profile (no rebuild, no restart)
   {_bold("stop")}     Remove this repo's persistent container ({_bold("--all")} for every repo)
-  {_bold("clean")}    Remove the container image and Nix store cache
+  {_bold("clean")}    Session-respecting reclaim: prune stopped containers + GC the
+           shared store ({_bold("--force")} also kills live sessions)
+  {_bold("reset")}    Delete the shared /nix volume and reseed from the image
   {_bold("check")}    Validate the Nix expression without building
   {_bold("doctor")}   Run environment health checks ({_bold("--json")} for machine output;
            exits 1 if any check needs attention)
   {_bold("help")}     Show this help message and exit
 """
 
-SUBCOMMANDS = {"setup", "shell", "build", "update", "stop", "clean", "check", "doctor", "help"}
+SUBCOMMANDS = {"setup", "shell", "build", "update", "stop", "clean", "reset", "check", "doctor", "help"}
 
 
 def die(msg: str) -> NoReturn:
@@ -512,9 +575,7 @@ def _ask_questions(current: Settings) -> Settings | None:
         if Path(host).expanduser().exists() or host in selected_builtin_hosts
     ]
     custom_choices: list[tuple[str, SharedMount, bool]] = [
-        (f"{m.host} -> {m.container}  custom read-only mount", m, True)
-        for m in current.shared_host_paths
-        if not m.builtin
+        (f"{m.host} -> {m.container}  custom read-only mount", m, True) for m in current.shared_host_paths if not m.builtin
     ]
     available = builtin_choices + custom_choices
     shared_host_paths: list[SharedMount] = []
@@ -674,7 +735,9 @@ def _check_pileup(engine: str) -> DoctorCheck | None:
         return None
     if count >= RUN_PILEUP_WARN:
         return DoctorCheck(
-            "warn", "all containers", f"{count} containers",
+            "warn",
+            "all containers",
+            f"{count} containers",
             fix="agent stop --all  ·  or  agent clean",
         )
     return DoctorCheck("info", "all containers", f"{count} containers")
@@ -686,7 +749,9 @@ def _check_nofile(engine: str, image: str) -> DoctorCheck:
     raw = _query_nofile_hard_limit(engine, image)
     if raw is None:
         return DoctorCheck(
-            "info", "open files", "not checked",
+            "info",
+            "open files",
+            "not checked",
             note="run `agent build` to check",
         )
     detail = "ulimit inside container"
@@ -701,7 +766,10 @@ def _check_nofile(engine: str, image: str) -> DoctorCheck:
     where = "Docker Desktop settings" if sys.platform == "darwin" else "docker daemon.json"
     # `nofile` stays literal: it's the actual daemon `default-ulimits` config key.
     return DoctorCheck(
-        "fail", "open files", str(limit), detail=detail,
+        "fail",
+        "open files",
+        str(limit),
+        detail=detail,
         note=f"too low — want {recommended}",
         fix=f"raise the nofile ulimit in {where}, then rebuild",
         why=[
@@ -760,20 +828,22 @@ def _doctor_verdict(checks: list[DoctorCheck]) -> None:
 
 
 def _doctor_json(checks: list[DoctorCheck]) -> None:
-    print(json.dumps(
-        [
-            {
-                "check": c.label,
-                "status": c.status,
-                "value": c.value,
-                "detail": c.detail or None,
-                "note": c.note or None,
-                "fix": c.fix or None,
-            }
-            for c in checks
-        ],
-        indent=2,
-    ))
+    print(
+        json.dumps(
+            [
+                {
+                    "check": c.label,
+                    "status": c.status,
+                    "value": c.value,
+                    "detail": c.detail or None,
+                    "note": c.note or None,
+                    "fix": c.fix or None,
+                }
+                for c in checks
+            ],
+            indent=2,
+        )
+    )
 
 
 def resolve_mount_root(settings: Settings) -> Path:
@@ -879,8 +949,7 @@ def _inspect_run_container(engine: str, name: str) -> tuple[bool, str] | None:
     """Return (running, fingerprint) for the named container, or None if absent.
     One inspect yields existence, run state, and the stored fingerprint together."""
     r = subprocess.run(
-        [engine, "inspect", "--format",
-         '{{.State.Running}}\t{{index .Config.Labels "agent.fingerprint"}}', name],
+        [engine, "inspect", "--format", '{{.State.Running}}\t{{index .Config.Labels "agent.fingerprint"}}', name],
         capture_output=True,
         text=True,
         check=False,
@@ -897,23 +966,41 @@ def create_run_container(engine: str, spec: RunSpec) -> None:
     mount_flags = [arg for m in spec.mounts for arg in ("-v", m)]
     env_flags = [arg for e in spec.env for arg in ("-e", e)]
     cmd = [
-        engine, "run", "-d", "--name", spec.name, "--init",
-        "--user", spec.user, f"--memory-swap={spec.memswap}", "--ulimit", spec.ulimit,
-        *mount_flags, *env_flags,
-        "--label", f"agent.fingerprint={spec.fingerprint}",
-        spec.image, "sleep", "infinity",
+        engine,
+        "run",
+        "-d",
+        "--name",
+        spec.name,
+        "--init",
+        "--user",
+        spec.user,
+        f"--memory-swap={spec.memswap}",
+        "--ulimit",
+        spec.ulimit,
+        *mount_flags,
+        *env_flags,
+        "--label",
+        f"agent.fingerprint={spec.fingerprint}",
+        spec.image,
+        "sleep",
+        "infinity",
     ]
     r = _run_quiet(cmd)
     if r.returncode != 0 and _inspect_run_container(engine, spec.name) is None:
         die(f"failed to create container {spec.name}:\n{r.stderr.decode(errors='replace').strip() or f'exit {r.returncode}'}")
 
 
-def ensure_run_container(engine: str, spec: RunSpec) -> None:
-    """Create-or-reuse: one inspect drives absent/stale/stopped/running."""
+def ensure_run_container(engine: str, spec: RunSpec) -> str:
+    """Create-or-reuse: one inspect drives absent/stale/stopped/running. Returns
+    the transition so the caller can (re)write the per-session gcroot only when
+    the container freshly starts on the current generation — `"fresh"` for a
+    newly created or restarted container, `"reused"` when joining one that was
+    already running (its gcroot already records its start generation)."""
     state = _inspect_run_container(engine, spec.name)
     if state is None:
         create_run_container(engine, spec)
-    elif state[1] != spec.fingerprint:
+        return "fresh"
+    if state[1] != spec.fingerprint:
         if state[0]:
             # Stale config (e.g. after `agent update`), but a session is still
             # running in it — recreating would kill that session. Join the old
@@ -923,14 +1010,17 @@ def ensure_run_container(engine: str, spec: RunSpec) -> None:
                 f"joining the existing (outdated) container instead of rebuilding. "
                 f"Run `agent stop` once no session is active to pick up the new config."
             )
-        else:
-            # Stopped and stale → safe to tear down and recreate.
-            _run_quiet([engine, "rm", "-f", spec.name])
-            create_run_container(engine, spec)
-    elif not state[0]:
+            return "reused"
+        # Stopped and stale → safe to tear down and recreate.
+        _run_quiet([engine, "rm", "-f", spec.name])
+        create_run_container(engine, spec)
+        return "fresh"
+    if not state[0]:
         # Stopped but matching → fast restart (the point of persistence).
         _run_quiet([engine, "start", spec.name])
+        return "fresh"
     # running + matching → nothing to do.
+    return "reused"
 
 
 def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path) -> RunSpec:
@@ -944,6 +1034,12 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
     mount_specs = [
         f"{mount_root}:{mount_root}",
         f"{home_volume}:/home/agent",
+        # The shared, persistent /nix store, mounted read-write. The session runs
+        # as the non-root agent user against the root-owned store, so ownership —
+        # not a read-only mount — enforces "read-only consumer": binaries execute
+        # via PATH, but the session cannot mutate the toolchain (that goes through
+        # `agent update`). Folded into the fingerprint like any other mount.
+        f"{nix_shared_volume(getpass.getuser())}:/nix",
     ]
     if Path("/etc/localtime").is_file():
         mount_specs.append("/etc/localtime:/etc/localtime:ro")
@@ -982,18 +1078,29 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
     )
 
 
-def _list_run_containers(engine: str) -> list[str]:
-    """Names of all persistent `agent-run-*` containers for this user (running or not)."""
-    r = subprocess.run(
-        [engine, "ps", "-a", "--filter", f"name={RUN_CONTAINER_PREFIX}", "--format", "{{.Names}}"],
-        capture_output=True, text=True, check=False,
-    )
+def _list_run_containers(engine: str, *, running_only: bool = False) -> list[str]:
+    """Names of persistent `agent-run-*` containers for this user. All by default;
+    `running_only` restricts to those currently up (live sessions)."""
+    cmd = [engine, "ps"] if running_only else [engine, "ps", "-a"]
+    cmd += ["--filter", f"name={RUN_CONTAINER_PREFIX}", "--format", "{{.Names}}"]
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return [n.strip() for n in r.stdout.splitlines() if n.strip()]
 
 
-def run_stop(engine: str, mount_root: Path, *, all_repos: bool) -> None:
+def _remove_all_run_containers(engine: str, reason: str) -> list[str]:
+    """Force-remove every persistent run container for this user (killing any live
+    session). Shared by `clean --force` and `reset`; returns the names removed."""
+    names = _list_run_containers(engine)
+    if names:
+        warn(f"{reason}: {', '.join(names)}")
+        _clean_step("Removing persistent containers", [engine, "rm", "-f", *names])
+    return names
+
+
+def run_stop(engine: str, image: str, mount_root: Path, *, all_repos: bool) -> None:
     """`agent stop`: full teardown (rm -f) to release the name and unpin the
-    image. `--all` sweeps every persistent container for this user."""
+    image, and drop the per-session gcroot(s) so the toolchain the session pinned
+    becomes collectable. `--all` sweeps every persistent container for this user."""
     if all_repos:
         names = _list_run_containers(engine)
         if not names:
@@ -1001,8 +1108,11 @@ def run_stop(engine: str, mount_root: Path, *, all_repos: bool) -> None:
             return
         _clean_step(f"Removing {len(names)} persistent container(s)", [engine, "rm", "-f", *names])
     else:
-        name = run_container_name(mount_root)
-        _clean_step(f"Stopping {name}", [engine, "rm", "-f", name], missing_ok=True)
+        names = [run_container_name(mount_root)]
+        _clean_step(f"Stopping {names[0]}", [engine, "rm", "-f", names[0]], missing_ok=True)
+    volume = nix_shared_volume(getpass.getuser())
+    if _volume_exists(engine, volume) and image_exists(engine, image):
+        remove_session_gcroots(engine, image, volume, names)
 
 
 def _is_container_running(engine: str, name: str) -> bool:
@@ -1065,18 +1175,87 @@ def _images_in_use(engine: str) -> set[str]:
     return image_ids
 
 
-def run_clean(engine: str) -> None:
-    # Persistent run containers pin their image (running or stopped), so a plain
-    # `rmi` can't reclaim it. Force-remove them first — unconditionally, even a
-    # live session — since `clean` is a deliberate reclaim. The `agent-build-*`
-    # container keeps its own skip-if-running guard and is untouched here.
-    run_names = _list_run_containers(engine)
-    if run_names:
-        warn(f"removing persistent container(s), killing any live session: {', '.join(run_names)}")
-        _clean_step("Removing persistent containers", [engine, "rm", "-f", *run_names])
+def run_clean(engine: str, image: str, *, force: bool = False) -> None:
+    """Session-respecting reclaim over two stores. Gentle (default): remove only
+    *stopped* run containers (to unpin their images), leave live sessions and
+    their images untouched, and GC the shared store keeping the current
+    generation + every generation still pinned by a live session. `--force`:
+    remove *all* run containers (killing live sessions) and GC the shared store
+    down to the current generation. Both also reclaim orphaned image tarballs."""
+    if force:
+        _remove_all_run_containers(engine, "removing persistent container(s), killing any live session")
+    else:
+        all_names = _list_run_containers(engine)
+        running = set(_list_run_containers(engine, running_only=True))
+        stopped = [n for n in all_names if n not in running]
+        if stopped:
+            _clean_step(f"Removing {len(stopped)} stopped container(s)", [engine, "rm", "-f", *stopped])
+        elif all_names:
+            print(f"{_sty('2', '•')} Leaving {len(all_names)} live session(s) untouched (use --force to reclaim).")
 
+    volume = nix_shared_volume(getpass.getuser())
+    if _volume_exists(engine, volume) and image_exists(engine, image):
+        # Reap after the removals above, so the running set reflects reality.
+        _gc_shared_store(engine, image, volume, set(_list_run_containers(engine, running_only=True)))
+
+    _reclaim_images(engine)
+    print(f"{_sty('1;32', '✓')} Clean finished.")
+
+
+def _gc_shared_store(engine: str, image: str, volume: str, running: set[str]) -> None:
+    """Reap session roots for not-running containers, then `nix-collect-garbage`
+    the shared store keeping the current generation + every generation with
+    number >= the oldest live session's. Also reclaims the build-time deps that
+    `agent update` left in the store."""
+    gather = (
+        f"readlink {DEFAULT_PROFILE}\n"
+        "echo ---GENS---\n"
+        f"ls {PROFILES_DIR} 2>/dev/null | grep -E '^default-[0-9]+-link$' || true\n"
+        "echo ---ROOTS---\n"
+        f"for r in {SESSION_GCROOT_DIR}/{SESSION_GCROOT_PREFIX}*; do "
+        '[ -L "$r" ] || continue; echo "$(basename "$r") $(readlink "$r")"; done\n'
+    )
+    probe = _shared_root(engine, image, volume, gather)
+    if probe.returncode != 0:
+        warn(f"could not read shared store state: {probe.stderr.strip() or f'exit {probe.returncode}'}")
+        return
+    lines = probe.stdout.splitlines()
+    current = parse_generation(lines[0]) if lines else None
+    if current is None:
+        warn("could not determine current generation; skipping store GC")
+        return
+    gens_section = lines[lines.index("---GENS---") + 1 : lines.index("---ROOTS---")]
+    roots_section = lines[lines.index("---ROOTS---") + 1 :]
+    all_gens = [g_ for g_ in (parse_generation(x) for x in gens_section) if g_ is not None]
+    root_gen: dict[str, int] = {}
+    for line in roots_section:
+        name, _, target = line.partition(" ")
+        gen = parse_generation(target)
+        if name and gen is not None:
+            root_gen[name] = gen
+
+    reap = session_roots_to_reap(list(root_gen), running)
+    live_gens = [gen for name, gen in root_gen.items() if name.removeprefix(SESSION_GCROOT_PREFIX) in running]
+    del_gens = generations_to_delete(all_gens, current, live_gens)
+
+    steps = [f"rm -f {SESSION_GCROOT_DIR}/{r}" for r in reap]
+    if del_gens:
+        steps.append(f"nix-env --profile {DEFAULT_PROFILE} --delete-generations " + " ".join(str(g_) for g_ in del_gens))
+    # Always collect: reclaims trimmed generations *and* update's build-time deps.
+    steps.append("nix-collect-garbage >&2")
+    print(
+        f"{_sty('1;34', '→')} Collecting shared store (keeping gen {current}"
+        + (f" + live {sorted(set(live_gens))}" if live_gens else "")
+        + ")..."
+    )
+    r = _shared_root(engine, image, volume, "\n".join(steps), stream=True)
+    if r.returncode != 0:
+        warn(f"shared store GC reported an error (exit {r.returncode})")
+
+
+def _reclaim_images(engine: str) -> None:
+    """Remove not-in-use agent image tags and orphaned build-cache tarballs."""
     in_use_ids = _images_in_use(engine)
-
     print(f"{_sty('1;34', '→')} Inspecting agent images...")
     r = subprocess.run(
         [engine, "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}", "agent"],
@@ -1111,7 +1290,7 @@ def run_clean(engine: str) -> None:
     # `nix-store --delete` never touches the toolchain closure, so rebuilds
     # stay fast — unlike a blanket `nix-collect-garbage`.
     if _volume_exists(engine, NIX_BUILD_CACHE_VOLUME):
-        reclaim = r'''
+        reclaim = r"""
             keep=$(for r in /nix/var/nix/gcroots/agent-image-*; do readlink "$r" 2>/dev/null; done)
             victims=""
             for t in /nix/store/*-agent.tar.gz /nix/store/*-agent.tar.zst; do
@@ -1119,12 +1298,145 @@ def run_clean(engine: str) -> None:
               case " $keep " in *" $t "*) ;; *) victims="$victims $t" ;; esac
             done
             if [ -n "$victims" ]; then nix-store --delete $victims; else echo "no orphaned tarballs"; fi
-        '''
+        """
         _clean_step(
             "Reclaiming build cache",
             [engine, "run", "--rm", "-v", f"{NIX_BUILD_CACHE_VOLUME}:/nix", NIX_IMAGE, "sh", "-c", reclaim],
         )
-    print(f"{_sty('1;32', '✓')} Clean finished.")
+
+
+def run_reset(engine: str, image: str) -> None:
+    """Deepest reclaim: delete the shared /nix volume and reseed from the image —
+    the scorched-earth option for structural changes or a corrupt store. Removes
+    every run container first (they mount the volume), then reseeds."""
+    _remove_all_run_containers(engine, "removing all persistent container(s) to release the volume")
+    volume = nix_shared_volume(getpass.getuser())
+    _clean_step(f"Deleting shared /nix volume {volume}", [engine, "volume", "rm", volume], missing_ok=True)
+    ensure_seeded(engine, image)
+    print(f"{_sty('1;32', '✓')} Reset finished — shared store reseeded from image.")
+
+
+# --- Shared /nix store lifecycle: orchestration (integration-verified) ---
+
+
+def _shared_root(
+    engine: str,
+    image: str,
+    volume: str,
+    script: str,
+    *,
+    extra_mounts: list[str] | None = None,
+    stream: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run `script` as root (`bash -c`) in a transient agent-image container with
+    the shared /nix volume mounted rw — the *single writer* of the root-owned
+    store. Uses the agent image (not nixos/nix) on purpose: mounting the shared
+    volume at /nix hides nixos/nix's own tooling, whereas the agent image
+    resolves bash/nix/nix-env through the volume's own profile. When `stream`,
+    the child's stderr flows to the terminal (long builds) while stdout is
+    captured for the caller to parse."""
+    mounts = [arg for m in (extra_mounts or []) for arg in ("-v", m)]
+    cmd = [
+        engine,
+        "run",
+        "--rm",
+        "--user",
+        "0:0",
+        "-v",
+        f"{volume}:/nix",
+        *mounts,
+        "-e",
+        f"NIX_CONFIG={NIX_ROOT_CONFIG}",
+        image,
+        "bash",
+        "-c",
+        script,
+    ]
+    if stream:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=False)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def _seed_lock_path(volume: str) -> Path:
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-container"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"seed-{volume}.lock"
+
+
+@contextlib.contextmanager
+def _seed_lock(volume: str) -> Iterator[None]:
+    """Host-side first-run lock so two concurrent cold starts can't both seed the
+    high-blast-radius shared volume (every repo shares this one store)."""
+    with _seed_lock_path(volume).open("w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def _shared_volume_seeded(engine: str, volume: str) -> bool:
+    """True once the shared volume holds a seeded, operable store. Mounts at
+    /probe (not /nix) so Docker's copy-into-empty-volume can't seed it from the
+    probe image as a side effect of the check. Tests the registered Nix DB — a
+    real file — rather than the profile symlink, whose store target isn't present
+    from the probe container's view (it would read as a dangling link)."""
+    r = _run_quiet([engine, "run", "--rm", "-v", f"{volume}:/probe", NIX_IMAGE, "sh", "-c", "test -f /probe/var/nix/db/db.sqlite"])
+    return r.returncode == 0
+
+
+def ensure_seeded(engine: str, image: str) -> str:
+    """Ensure the per-user shared /nix volume exists and is seeded from the
+    image's baked /nix, serialized by a first-run flock. Builds the image first
+    if missing. Shared by `run` and `update`, so seeding lives in one place and
+    neither command has an ordering precondition. Returns the volume name."""
+    volume = nix_shared_volume(getpass.getuser())
+    if _volume_exists(engine, volume) and _shared_volume_seeded(engine, volume):
+        return volume
+    if not image_exists(engine, image):
+        build(engine, image)
+    _run_quiet([engine, "volume", "create", volume])
+    with _seed_lock(volume):
+        if _shared_volume_seeded(engine, volume):
+            return volume  # lost the first-run race; the winner seeded it
+        print(f"{_sty('1;34', '→')} Seeding shared /nix store {volume} from image (one-time)...")
+        # Docker copies the image's baked /nix into the empty volume on mount.
+        r = _run_quiet([engine, "run", "--rm", "-v", f"{volume}:/nix", image, "true"])
+        if r.returncode != 0:
+            err = r.stderr.decode(errors="replace").strip() or f"exit {r.returncode}"
+            die(f"failed to seed shared /nix volume {volume}:\n{err}")
+        if not _shared_volume_seeded(engine, volume):
+            # The copy succeeded but the store has no registered Nix DB — the
+            # image predates the persistent /nix rework. Drop the half-seeded
+            # volume so a retry after rebuilding starts clean.
+            _run_quiet([engine, "volume", "rm", volume])
+            die(
+                f"image {image} predates the persistent /nix store (no registered "
+                f"Nix DB in its baked /nix). Rebuild it with `agent build`, then retry."
+            )
+        print(f"{_sty('1;32', '✓')} Seeded {volume}.")
+    return volume
+
+
+def write_session_gcroot(engine: str, image: str, volume: str, container: str) -> None:
+    """Record, on the *host*, the generation a container started on:
+    `gcroots/session-<container>` → the current `default-N-link`. The host is the
+    only actor that sees all containers (each has its own PID namespace, so Nix's
+    runtime-root scan can't protect a sibling's in-use toolchain). One symlink
+    both pins the closure and records N (clean reads N back via readlink)."""
+    script = (
+        f"gen=$(readlink {DEFAULT_PROFILE}) && "
+        f"mkdir -p {SESSION_GCROOT_DIR} && "
+        f"ln -sfn {PROFILES_DIR}/$gen {SESSION_GCROOT_DIR}/{SESSION_GCROOT_PREFIX}{container}"
+    )
+    r = _shared_root(engine, image, volume, script)
+    if r.returncode != 0:
+        warn(f"could not write session gcroot for {container}: {r.stderr.strip() or f'exit {r.returncode}'}")
+
+
+def remove_session_gcroots(engine: str, image: str, volume: str, containers: list[str]) -> None:
+    """Remove the per-session gcroots for the given containers (on `agent stop`)."""
+    if not containers:
+        return
+    links = " ".join(f"{SESSION_GCROOT_DIR}/{SESSION_GCROOT_PREFIX}{c}" for c in containers)
+    _shared_root(engine, image, volume, f"rm -f {links}")
 
 
 def build(engine: str, image: str) -> None:
@@ -1148,46 +1460,14 @@ def build(engine: str, image: str) -> None:
     _run_quiet([engine, "rm", build_name])
     _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
 
-    # Cheap pre-check: realize the image derivation and print its store path
-    # (seconds when the tarball is already cached, vs ~70s to stream and load
-    # the multi-GB tarball). The store-path hash keys a marker tag
-    # `agent:src-<hash>`; if that marker exists we've already loaded this exact
-    # tarball, so we can skip `docker load` and just re-tag. Kept under the
-    # `agent` repo so `agent clean`'s sweep removes markers too.
-    #
-    # AGENT_UID/AGENT_GID must match the build below: the image derivation
-    # `chown`s to them, so a mismatch would realize a *different* image here
-    # than we load, keying the marker on the wrong hash and building the image
-    # twice. `--out-link` registers a gcroot so the current image (and its
-    # whole toolchain closure, ~330 refs) survives `nix-collect-garbage`.
+    # `agent build` is now a *rare* seed — routine toolchain bumps reach the
+    # store through in-place `agent update`, never a re-ship — so the path is a
+    # linear build → load → tag (the old `agent:src-<hash>` marker short-circuit,
+    # which only accelerated repeated identical builds, is gone). `--out-link`
+    # registers a gcroot so the built image tarball survives `nix-collect-garbage`
+    # in the build cache; `agent clean` reads these gcroots to reclaim orphans.
+    # AGENT_UID/AGENT_GID feed the impure `.#image` (baked agent user, home chown).
     gcroot = f"/nix/var/nix/gcroots/agent-image-u{uid}g{gid}"
-    print(f"{_sty('1;34', '→')} Resolving image...")
-    probe = subprocess.run(
-        [
-            engine, "run", "--rm", "--name", build_name,
-            "-v", f"{NIX_BUILD_CACHE_VOLUME}:/nix",
-            "-v", f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z",
-            "-e", f"AGENT_UID={uid}",
-            "-e", f"AGENT_GID={gid}",
-            NIX_IMAGE, "sh", "-c",
-            f"mkdir -p /nix/var/nix/gcroots && nix build path:/build#image"
-            f" --out-link {gcroot} --print-out-paths"
-            " --impure --extra-experimental-features 'nix-command flakes'",
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    if probe.returncode != 0:
-        die(f"nix build failed (exit {probe.returncode}):\n{probe.stderr.strip() or '(no output)'}")
-    out_path = probe.stdout.strip().splitlines()[-1] if probe.stdout.strip() else ""
-    sm = re.match(r"/nix/store/([a-z0-9]+)-", out_path)
-    if sm is None:
-        die(f"could not parse nix store path from build output:\n{out_path or '(empty)'}")
-    marker = f"agent:src-{sm.group(1)}"
-    if image_exists(engine, marker):
-        subprocess.run([engine, "tag", marker, image], check=True)
-        print(f"{_sty('1;32', '✓')} Reused {marker}; tagged as {image}")
-        return
-
     print(f"{_sty('1;34', '→')} Building...")
     build_proc = subprocess.Popen(
         [
@@ -1207,7 +1487,8 @@ def build(engine: str, image: str) -> None:
             NIX_IMAGE,
             "sh",
             "-c",
-            'cat "$(nix build path:/build#image --no-link --print-out-paths'
+            "mkdir -p /nix/var/nix/gcroots && "
+            f'cat "$(nix build path:/build#image --out-link {gcroot} --print-out-paths'
             " --impure --extra-experimental-features 'nix-command flakes')\"",
         ],
         stdout=subprocess.PIPE,
@@ -1240,14 +1521,17 @@ def build(engine: str, image: str) -> None:
     if m is None:
         die(f"could not extract image tag from `{engine} load` output:\n{load.stdout.strip() or '(empty)'}")
     subprocess.run([engine, "tag", m.group(0), image], check=True)
-    subprocess.run([engine, "tag", m.group(0), marker], check=True)
     print(f"{_sty('1;32', '✓')} Tagged {m.group(0)} as {image}")
-    # No volume removal: runtime volume name is derived from image ID at
-    # `agent run`, so the new image gets its own fresh volume on first use.
-    # Any agent still running against the previous image keeps its volume.
 
 
-def run_update(engine: str) -> None:
+def run_update(engine: str, image: str) -> None:
+    """The whole in-place toolchain upgrade, end-to-end, with no image rebuild
+    and no container restart: seed-if-needed → bump flake.lock + commit → build
+    `.#toolchain` straight into the shared store → atomic profile swap. The swap
+    only adds a generation and deletes nothing, so it is safe while sessions are
+    live (reclamation is the separate `agent clean`)."""
+    volume = ensure_seeded(engine, image)
+
     _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
     print(f"{_sty('1;34', '→')} Updating flake.lock...")
     subprocess.run(
@@ -1267,19 +1551,53 @@ def run_update(engine: str) -> None:
         check=True,
     )
     print(f"{_sty('1;32', '✓')} flake.lock updated.")
-    r = subprocess.run(
-        ["git", "-C", str(SCRIPT_DIR), "diff", "--quiet", "HEAD", "--", "agent-image/flake.lock"],
-        check=False,
+    lock_unchanged = (
+        subprocess.run(
+            ["git", "-C", str(SCRIPT_DIR), "diff", "--quiet", "HEAD", "--", "agent-image/flake.lock"],
+            check=False,
+        ).returncode
+        == 0
     )
-    if r.returncode == 0:
+    if lock_unchanged:
         print(_sty("2", "  flake.lock unchanged — nothing to commit."))
-        return
-    subprocess.run(["git", "-C", str(SCRIPT_DIR), "add", "agent-image/flake.lock"], check=True)
-    subprocess.run(
-        ["git", "-C", str(SCRIPT_DIR), "commit", "-m", "Update flake.lock"],
-        check=True,
+    else:
+        subprocess.run(["git", "-C", str(SCRIPT_DIR), "add", "agent-image/flake.lock"], check=True)
+        subprocess.run(["git", "-C", str(SCRIPT_DIR), "commit", "-m", "Update flake.lock"], check=True)
+        print(f"{_sty('1;32', '✓')} Committed.")
+
+    # Build `.#toolchain` (pure, no --impure) straight into the shared store and
+    # atomically repoint the default profile — the new generation is rooted just
+    # by being the profile. Build only swaps when the toolchain path actually
+    # changed, so a no-op update never piles up redundant generations.
+    print(f"{_sty('1;34', '→')} Building toolchain and swapping the profile...")
+    build_and_swap = (
+        "set -e\n"
+        "tc=$(nix build path:/build#toolchain --no-link --print-out-paths)\n"
+        f"cur=$(readlink -f {DEFAULT_PROFILE} 2>/dev/null || true)\n"
+        'if [ "$tc" = "$cur" ]; then\n'
+        '  echo "RESULT uptodate $tc"\n'
+        "else\n"
+        f'  nix-env --profile {DEFAULT_PROFILE} --set "$tc" >&2\n'
+        '  echo "RESULT swapped $tc"\n'
+        "fi\n"
     )
-    print(f"{_sty('1;32', '✓')} Committed.")
+    r = _shared_root(
+        engine,
+        image,
+        volume,
+        build_and_swap,
+        extra_mounts=[f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z"],
+        stream=True,
+    )
+    if r.returncode != 0:
+        die(f"toolchain build/swap failed (exit {r.returncode})")
+    result = re.search(r"^RESULT (uptodate|swapped) (\S+)", r.stdout, re.M)
+    if result is None:
+        die(f"could not parse update result:\n{r.stdout.strip() or '(empty)'}")
+    if result.group(1) == "uptodate":
+        print(f"{_sty('1;32', '✓')} Toolchain already current — no swap needed.")
+    else:
+        print(f"{_sty('1;32', '✓')} Swapped default profile to {result.group(2)}.")
 
 
 def parse_args(argv: list[str]) -> tuple[str, list[str], dict[str, Any]]:
@@ -1341,15 +1659,19 @@ def main() -> None:
         return
 
     if cmd == "clean":
-        run_clean(engine)
+        run_clean(engine, image, force="--force" in extra)
+        return
+
+    if cmd == "reset":
+        run_reset(engine, image)
         return
 
     if cmd == "stop":
-        run_stop(engine, resolve_mount_root(settings), all_repos="--all" in extra)
+        run_stop(engine, image, resolve_mount_root(settings), all_repos="--all" in extra)
         return
 
     if cmd == "update":
-        run_update(engine)
+        run_update(engine, image)
         return
 
     if cmd == "check":
@@ -1385,10 +1707,11 @@ def main() -> None:
     mount_root = resolve_mount_root(settings)
 
     uid, gid = os.getuid(), os.getgid()
-    # /nix is not volume-mounted: the container uses the image's built-in
-    # /nix layer directly, so no seed-copy is needed on first run per image.
-    # Nix store writes during a session (e.g. `nix build`) don't persist
-    # across `--rm` runs.
+    # The shared /nix store is mounted read-write at /nix (folded into the run
+    # spec's mounts). Seed it from the image's baked /nix on first ever use,
+    # serialized by a first-run flock; every later container just mounts the
+    # populated volume. `agent update` upgrades this store in place — no rebuild.
+    volume = ensure_seeded(engine, image)
     # The home volume is still separate: Docker seeds it from image content
     # on first creation. Home on a named volume (not a bind mount) keeps all
     # of ~/.elan, ~/.cache, ~/.local etc on native container fs, avoiding
@@ -1402,12 +1725,23 @@ def main() -> None:
         print(f"{_sty('1;34', '→')} Migrating old home directory into {home_volume}...")
         _run_quiet([engine, "volume", "create", home_volume])
         r = subprocess.run(
-            [engine, "run", "--rm",
-             "-v", f"{old_home}:/mnt/old-home:ro",
-             "-v", f"{home_volume}:/home/agent",
-             "--entrypoint", "sh",
-             image, "-c", "cp -a /mnt/old-home/. /home/agent/"],
-            capture_output=True, text=True, check=False,
+            [
+                engine,
+                "run",
+                "--rm",
+                "-v",
+                f"{old_home}:/mnt/old-home:ro",
+                "-v",
+                f"{home_volume}:/home/agent",
+                "--entrypoint",
+                "sh",
+                image,
+                "-c",
+                "cp -a /mnt/old-home/. /home/agent/",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if r.returncode != 0:
             warn(f"migration failed: {r.stderr.strip() or f'exit {r.returncode}'}")
@@ -1416,7 +1750,13 @@ def main() -> None:
 
     # Create-or-reuse the per-repo persistent container, then exec into it.
     spec = build_run_spec(engine, settings, image, mount_root)
-    ensure_run_container(engine, spec)
+    state = ensure_run_container(engine, spec)
+    # When the container freshly (re)starts, its new processes resolve the
+    # current generation — record it as a host-written gcroot so a concurrent
+    # `agent update`/`agent clean` in another repo can't collect the toolchain
+    # this session is using. A reused-running container keeps its start-gen root.
+    if state == "fresh":
+        write_session_gcroot(engine, image, volume, spec.name)
 
     # Only -w varies per call (cwd within the fixed mount_root); -t only with a
     # real TTY so piped/CI stdin isn't forced interactive.
