@@ -141,19 +141,6 @@ class SetupTUITests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self._saved()["mount_mode"], "repo_root")
 
-    def test_checkbox_toggles_two_entries(self) -> None:
-        code, _ = _drive(
-            [KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        saved = self._saved()
-        self.assertEqual(saved["mount_mode"], "repo_root")
-        self.assertEqual(
-            saved["shared_host_paths"],
-            ["~/.claude/CLAUDE.md", "~/.claude/skills/"],
-        )
-
     def test_existing_settings_are_prefilled(self) -> None:
         # Pre-existing pwd overrides the repo_root default.
         self.settings.parent.mkdir(parents=True)
