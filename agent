@@ -755,6 +755,30 @@ _DOCTOR_GLYPH = {"ok": ("✓", green), "info": ("•", cyan), "warn": ("!", yell
 _DOCTOR_LABEL_W = 16
 
 
+def _col(styled: str, width: int) -> str:
+    """Left-justify to `width` *visible* columns (colour codes don't count)."""
+    return styled + " " * max(0, width - _visible_width(styled))
+
+
+_SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([A-Za-z]+)\s*$")
+
+
+def _fmt_size(size: str | None, *, round_int: bool = False) -> str:
+    """Docker's sizes come glued (`54.36GB`); render them spaced (`54.36 GB`), and
+    optionally rounded to a whole number for compact summaries (`32 GB`). Anything
+    that doesn't parse passes through untouched."""
+    if not size:
+        return ""
+    m = _SIZE_RE.match(size)
+    if not m:
+        return size
+    num, unit = m.group(1), m.group(2)
+    if round_int:
+        with contextlib.suppress(ValueError):
+            num = str(round(float(num)))
+    return f"{num} {unit}"
+
+
 @dataclass
 class DoctorCheck:
     """One health check's result. `value` is the primary reading; `detail` is dim
@@ -833,13 +857,14 @@ def _check_toolchain(probe: Probe | None) -> DoctorCheck:
         if probe.generation != 1:
             detail_bits.append("sync unknown")
     elif probe.applied and probe.applied != probe.desired:
-        detail_bits.append("flake.lock ahead")
+        # "flake.lock ahead" is the warn *reason*, carried by the fix line (rendered on
+        # its own continuation row) — not repeated in the neutral detail column.
         return DoctorCheck(
             "warn",
             "toolchain",
             value,
             detail=" · ".join(detail_bits),
-            fix="flake.lock is ahead of the store — run `agent update`",
+            fix="flake.lock ahead — run `agent update`",
         )
     return DoctorCheck("ok", "toolchain", value, detail=" · ".join(detail_bits))
 
@@ -1011,7 +1036,9 @@ def _container_status(c: RunContainer) -> str:
     if not c.running:
         return dim("stopped")
     if c.fresh is False:
-        return cyan("config drift")
+        # Cause-agnostic on purpose: a container is stale either because its image was
+        # rebuilt (superseded) or its config changed — both mean the next call recreates.
+        return yellow("recreates next run")
     if c.fresh is True:
         return dim("up to date")
     return dim("running")
@@ -1027,24 +1054,29 @@ def _doctor_render(
     image: str,
 ) -> None:
     print()
+    # Align the detail column across checks: pad every value to the widest one so
+    # `v29.6.1` / `gen 3 …` / `ample` start at the same column and scan vertically.
+    val_w = max((len(c.value) for c in checks), default=0)
+    detail_indent = "  " + " " + "  " + " " * _DOCTOR_LABEL_W  # under the value column
     for c in checks:
         glyph, colour = _DOCTOR_GLYPH[c.status]
         value = dim(c.value) if c.status in ("ok", "info") else colour(c.value)
-        line = f"  {colour(glyph)}  {c.label.ljust(_DOCTOR_LABEL_W)}{value}"
+        line = f"  {colour(glyph)}  {c.label.ljust(_DOCTOR_LABEL_W)}{_col(value, val_w)}"
         if c.detail:
-            line += f"  {dim('·')}  {dim(c.detail)}"
+            line += f"   {dim(c.detail)}"
         if c.note:
             line += f"  {dim('(' + c.note + ')')}"
-        # Single-line remediation rides on the same line; the multi-line block
-        # (why/fix_block, fail only) is reserved for fixes that aren't one command.
-        if c.fix and not c.fix_block:
-            line += f"  {dim('fix: ' + c.fix)}"
         print(line)
+        # A one-command fix drops to its own row under the value column (the warn
+        # reason). The multi-line block (why/fix_block, fail only) is a separate path.
+        if c.fix and not c.fix_block:
+            print(detail_indent + dim(c.fix))
         if c.why or c.fix_block:
             _doctor_remediation(c)
     _render_tree(containers, tag_map, current_short)
     _render_volumes(volumes, vol_sizes, image)
-    _doctor_verdict(checks)
+    reclaimable = vol_sizes.get(LEGACY_BUILD_CACHE_VOLUME) if LEGACY_BUILD_CACHE_VOLUME in volumes else None
+    _doctor_verdict(checks, containers, reclaimable)
 
 
 def _render_tree(
@@ -1064,10 +1096,14 @@ def _render_tree(
         print("    " + dim("none yet"))
         return
     for image_short, members in groups.items():
-        tag = tag_map.get(image_short)
-        header = cyan(tag) if tag else f"{image_short} {dim('(untagged)')}"
+        # Consistent identity: the current image by its stable tag (`agent:u501g20`);
+        # any other image a container still sits on is a superseded build, shown by a
+        # short id — never its raw nix content tag (`agent:4zccz…`), which is noise.
         if image_short == current_short:
-            header += dim("  (current)")
+            handle = tag_map.get(image_short) or image_short[:6]
+            header = cyan(handle) + dim("   ·  current build")
+        else:
+            header = image_short[:6] + dim("   ·  superseded build")
         print("    " + header)
         if not members:
             print(f"      {dim('└─ no containers')}")
@@ -1082,34 +1118,38 @@ def _render_tree(
 
 
 def _render_volumes(volumes: list[str], vol_sizes: dict[str, str], image: str) -> None:
-    """Roster of this tool's volumes by role (not raw names), each with its disk
-    use, plus the seed relationship — the shared store is a copy of the image's
-    baked /nix, which `agent reset` reseeds and `agent update` mutates in place."""
+    """Roster of this tool's volumes by role (not raw names), one aligned row each:
+    role · size · note. The shared store is a copy of the image's baked /nix (`agent
+    reset` reseeds, `agent update` mutates in place); the pre-rename cache is stale
+    reclaimable disk, never silently omitted."""
     store = nix_shared_volume(getpass.getuser())
-
-    def _role(name: str, label: str) -> str | None:
-        if name not in volumes:
-            return None
-        size = vol_sizes.get(name)
-        return f"{label} {size}" if size else label
-
-    roles = [
-        r
-        for r in (
-            _role(next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), ""), "home"),
-            _role(store, "nix-store (shared)"),
-            _role(NIX_BUILD_CACHE_VOLUME, "build-cache"),
-        )
-        if r
+    home = next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), "")
+    # (name, label, note) in display order; only those present render.
+    spec = [
+        (home, "home", ""),
+        (store, "nix-store (shared)", f"seeded from {image}"),
+        (NIX_BUILD_CACHE_VOLUME, "build-cache", ""),
+        (LEGACY_BUILD_CACHE_VOLUME, "build-cache (old)", "reclaim with `agent clean`"),
+    ]
+    rows = [
+        (label, _fmt_size(vol_sizes.get(name)), note) for name, label, note in spec if name in volumes
     ]
     print()
-    print("  " + bold("volumes") + "   " + dim(" · ".join(roles) if roles else "none"))
-    if store in volumes:
-        print("    " + dim(f"store seeded from image {image}"))
-    # Don't silently omit the pre-rename cache — it's reclaimable disk, not state.
-    if LEGACY_BUILD_CACHE_VOLUME in volumes:
-        legacy = _role(LEGACY_BUILD_CACHE_VOLUME, "old build-cache")
-        print("    " + dim(f"{legacy} — reclaim with `agent clean`"))
+    print("  " + bold("volumes"))
+    if not rows:
+        print("    " + dim("none"))
+        return
+    label_w = max(len(label) for label, _, _ in rows)
+    size_w = max((len(size) for _, size, _ in rows), default=0)
+    for label, size, note in rows:
+        line = "    " + label.ljust(label_w) + "  " + dim(size.rjust(size_w))
+        if note:
+            line += "   " + dim(note)
+        print(line)
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
 
 
 def _doctor_remediation(c: DoctorCheck) -> None:
@@ -1126,17 +1166,38 @@ def _doctor_remediation(c: DoctorCheck) -> None:
     print()
 
 
-def _doctor_verdict(checks: list[DoctorCheck]) -> None:
+def _doctor_verdict(
+    checks: list[DoctorCheck], containers: list[RunContainer], reclaimable: str | None
+) -> None:
+    """One closing line: the check verdict, then any actionable inventory (containers
+    that will recreate, disk that can be reclaimed). Only the checks gate the exit code
+    upstream — the inventory items are advisory and never change it."""
     n = len(checks)
     fails = sum(c.status == "fail" for c in checks)
     warns = sum(c.status == "warn" for c in checks)
-    print()
+    recreate = sum(1 for c in containers if c.fresh is False)
+
+    inventory = []
+    if recreate:
+        verb = _plural(recreate, "recreates", "recreate")
+        inventory.append(f"{recreate} {_plural(recreate, 'container', 'containers')} {verb} next run")
+    if reclaimable:
+        inventory.append(f"{_fmt_size(reclaimable, round_int=True)} reclaimable")
+
     if fails:
-        print(f"  {red('✗')}  {red(f'{fails} need attention')}  {dim(f'· {n - fails} ok')}")
+        glyph, lead = red("✗"), red(f"{fails} need attention")
     elif warns:
-        print(f"  {yellow('!')}  {yellow(f'{warns} advisory')}  {dim(f'· {n - warns} ok')}")
+        glyph, lead = yellow("!"), yellow(f"{warns} advisory")
+    elif inventory:
+        # Checks are clean but there's something to act on — flag it, and say "checks ok"
+        # rather than "all passed" so the ! doesn't read as contradicting the lead.
+        glyph, lead = yellow("!"), green("checks ok")
     else:
-        print(f"  {green('✓')}  {green(f'all {n} checks passed')}")
+        glyph, lead = green("✓"), green(f"all {n} checks passed")
+
+    parts = [lead, *(dim(p) for p in inventory)]
+    print()
+    print(f"  {glyph}  " + dim("  ·  ").join(parts))
 
 
 def _doctor_json(

@@ -65,7 +65,9 @@ class TestToolchainDrift:
         p = self._probe(applied="/nix/store/aaa-toolchain", desired="/nix/store/bbb-toolchain")
         c = agent._check_toolchain(p)
         assert c.status == "warn"  # advisory, so `agent doctor && …` still passes
-        assert "flake.lock ahead" in (c.detail or "")
+        # The drift reason rides on the fix line (rendered on its own row), not the
+        # neutral detail column.
+        assert "flake.lock ahead" in (c.fix or "")
         assert "agent update" in (c.fix or "")
 
     def test_unknown_never_claims_in_sync(self):
