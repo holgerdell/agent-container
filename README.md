@@ -11,7 +11,7 @@ Yet another script for running a coding agent in an isolated container. Here's w
 - 🐳 Runs the agent inside an isolated container
 - 📁 Only the current workspace is mounted into the container
 - 🔒 Selected config files (`~/.gitconfig`, etc.) can optionally be mounted read-only
-- 🗂️ The container's home directory is persisted in an isolated location (`~/.local/share/agent-container/home/`)
+- 🗂️ The container's home directory is persisted across runs in an isolated, per-user named volume
 - ❄️ The container uses Nix instead of a Dockerfile, which makes it easy to customize to your needs
 
 ## Requirements
@@ -53,7 +53,7 @@ agent -- --print "hello"
 agent shell -- -c 'echo hi'
 ```
 
-`agent setup` configures the workspace root (current directory or git repo root) and read-only host mounts (`~/.gitconfig`, `~/.claude/`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
+`agent setup` configures the workspace root (current directory or git repo root) and read-only host mounts (`~/.gitconfig`, `~/.claude/CLAUDE.md`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
 
 The agent's home directory is persisted across runs in a named volume. The Nix store is a **persistent, writeable, per-user volume** shared across all your repos, seeded once from the image's baked `/nix` on first run. `agent update` upgrades the toolchain *in place* — it builds the new toolchain straight into the shared store and atomically swaps the Nix profile, so a new shell picks it up with no image rebuild and no container restart. `agent clean` reclaims old toolchain generations while protecting any that a live session is still using; `agent reset` deletes the shared volume and reseeds from scratch.
 

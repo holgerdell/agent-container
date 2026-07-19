@@ -1281,7 +1281,10 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
     ]
     if Path("/etc/localtime").is_file():
         mount_specs.append("/etc/localtime:/etc/localtime:ro")
-    cred_cache = Path.home() / ".cache/git/credential"
+    # Host git puts the credential-cache socket under $XDG_CACHE_HOME (default
+    # ~/.cache); mount from there so it lines up with the daemon's actual path.
+    host_cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    cred_cache = host_cache / "git/credential"
     if cred_cache.is_dir():
         mount_specs.append(f"{cred_cache}:/home/agent/.cache/git/credential")
     for mount in settings.shared_host_paths:
