@@ -1714,7 +1714,8 @@ def build(engine: str, image: str) -> None:
     # in the build cache; `agent clean` reads these gcroots to reclaim orphans.
     # AGENT_UID/AGENT_GID feed the impure `.#image` (baked agent user, home chown).
     gcroot = f"/nix/var/nix/gcroots/agent-image-u{uid}g{gid}"
-    print(f"{_sty('1;34', '→')} Building...")
+    print(f"{_sty('1;35', '⬢')} {_bold('build → image')} {dim('(seed for new sessions)')}")
+    print(f"  {_sty('1;34', '→')} Building image {image}  {dim('(nix .#image)')}")
     build_proc = subprocess.Popen(
         [
             engine,
@@ -1740,7 +1741,7 @@ def build(engine: str, image: str) -> None:
         stdout=subprocess.PIPE,
     )
     assert build_proc.stdout is not None
-    print(f"{_sty('1;34', '→')} Loading...")
+    print(f"  {_sty('1;34', '→')} Loading into {engine}  {dim('(tarball → engine)')}")
     load = subprocess.run(
         [engine, "load"],
         stdin=build_proc.stdout,
@@ -1767,7 +1768,7 @@ def build(engine: str, image: str) -> None:
     if m is None:
         die(f"could not extract image tag from `{engine} load` output:\n{load.stdout.strip() or '(empty)'}")
     subprocess.run([engine, "tag", m.group(0), image], check=True)
-    print(f"{_sty('1;32', '✓')} Tagged {m.group(0)} as {image}")
+    print(f"  {_sty('1;32', '✓')} Image {image} ready")
 
 
 def run_update(engine: str, image: str) -> None:
@@ -1776,10 +1777,11 @@ def run_update(engine: str, image: str) -> None:
     `.#toolchain` straight into the shared store → atomic profile swap. The swap
     only adds a generation and deletes nothing, so it is safe while sessions are
     live (reclamation is the separate `agent clean`)."""
+    print(f"{_sty('1;35', '⬢')} {_bold('update → shared /nix store, in place')}")
     volume = ensure_seeded(engine, image)
 
     _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
-    print(f"{_sty('1;34', '→')} Updating flake.lock...")
+    print(f"  {_sty('1;34', '→')} Updating flake.lock  {dim('(agent-image/)')}")
     subprocess.run(
         [
             engine,
@@ -1796,7 +1798,7 @@ def run_update(engine: str, image: str) -> None:
         ],
         check=True,
     )
-    print(f"{_sty('1;32', '✓')} flake.lock updated.")
+    print(f"  {_sty('1;32', '✓')} flake.lock updated.")
     lock_unchanged = (
         subprocess.run(
             ["git", "-C", str(SCRIPT_DIR), "diff", "--quiet", "HEAD", "--", "agent-image/flake.lock"],
@@ -1809,13 +1811,13 @@ def run_update(engine: str, image: str) -> None:
     else:
         subprocess.run(["git", "-C", str(SCRIPT_DIR), "add", "agent-image/flake.lock"], check=True)
         subprocess.run(["git", "-C", str(SCRIPT_DIR), "commit", "-m", "Update flake.lock"], check=True)
-        print(f"{_sty('1;32', '✓')} Committed.")
+        print(f"  {_sty('1;32', '✓')} Committed.")
 
     # Build `.#toolchain` (pure, no --impure) straight into the shared store and
     # atomically repoint the default profile — the new generation is rooted just
     # by being the profile. Build only swaps when the toolchain path actually
     # changed, so a no-op update never piles up redundant generations.
-    print(f"{_sty('1;34', '→')} Building toolchain and swapping the profile...")
+    print(f"  {_sty('1;34', '→')} Building toolchain  {dim(f'(nix .#toolchain → {volume})')}")
     build_and_swap = (
         "set -e\n"
         "tc=$(nix build path:/build#toolchain --no-link --print-out-paths)\n"
@@ -1841,9 +1843,9 @@ def run_update(engine: str, image: str) -> None:
     if result is None:
         die(f"could not parse update result:\n{r.stdout.strip() or '(empty)'}")
     if result.group(1) == "uptodate":
-        print(f"{_sty('1;32', '✓')} Toolchain already current — no swap needed.")
+        print(f"  {_sty('1;32', '✓')} Toolchain current — no change  {dim('(live sessions unaffected)')}")
     else:
-        print(f"{_sty('1;32', '✓')} Swapped default profile to {result.group(2)}.")
+        print(f"  {_sty('1;32', '✓')} Swapped profile → {result.group(2)}  {dim('(live sessions unaffected)')}")
 
 
 def parse_args(argv: list[str]) -> tuple[str, list[str], dict[str, Any]]:
