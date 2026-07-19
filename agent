@@ -1584,6 +1584,11 @@ def _shared_root(
         f"{volume}:/nix",
         *mounts,
         "-e",
+        # The image bakes HOME=/home/agent (owned by the agent user), but this
+        # container runs as root — nix would warn and fall back to /root from
+        # passwd. Point HOME at /root up front to match, silencing the warning.
+        "HOME=/root",
+        "-e",
         f"NIX_CONFIG={NIX_ROOT_CONFIG}",
         image,
         "bash",
