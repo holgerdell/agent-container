@@ -23,9 +23,10 @@ class TestNixSharedVolume:
         assert agent.nix_shared_volume("hold") == "agent-nix-hold"
 
     def test_distinct_from_build_cache(self):
-        # The build-cache volume is `agent-nix-store`; a user literally named
-        # "store" would collide, but ordinary usernames never do.
+        # The build cache lives outside the `agent-nix-` store namespace
+        # (`agent-buildcache`), so no username can ever collide with it.
         assert agent.nix_shared_volume("alice") != agent.NIX_BUILD_CACHE_VOLUME
+        assert not agent.NIX_BUILD_CACHE_VOLUME.startswith(agent.NIX_SHARED_VOLUME_PREFIX)
 
 
 class TestParseGeneration:
@@ -43,6 +44,43 @@ class TestParseGeneration:
         assert agent.parse_generation("default") is None
         assert agent.parse_generation("") is None
         assert agent.parse_generation("/nix/store/abc-agent-toolchain") is None
+
+
+class TestToolchainDrift:
+    """`_check_toolchain` folds the flake.lock-vs-store drift signal into its own
+    check as an advisory `warn` — never a `fail` that would trip `agent doctor &&`."""
+
+    def _probe(self, **kw):
+        base = dict(claude="9", opencode="1", nofile="1048576", generation=3, lock_date="2026-07-19")
+        base.update(kw)
+        return agent.Probe(**base)
+
+    def test_in_sync_is_ok_and_quiet(self):
+        p = self._probe(applied="/nix/store/aaa-toolchain", desired="/nix/store/aaa-toolchain")
+        c = agent._check_toolchain(p)
+        assert c.status == "ok"
+        assert "sync" not in (c.detail or "")
+
+    def test_drift_warns_and_points_at_update(self):
+        p = self._probe(applied="/nix/store/aaa-toolchain", desired="/nix/store/bbb-toolchain")
+        c = agent._check_toolchain(p)
+        assert c.status == "warn"  # advisory, so `agent doctor && …` still passes
+        assert "flake.lock ahead" in (c.detail or "")
+        assert "agent update" in (c.fix or "")
+
+    def test_unknown_never_claims_in_sync(self):
+        # Seed store: eval couldn't answer offline → desired is None.
+        p = self._probe(generation=3, applied="/nix/store/aaa-toolchain", desired=None)
+        c = agent._check_toolchain(p)
+        assert c.status == "ok"
+        assert "sync unknown" in (c.detail or "")
+
+    def test_gen1_seed_omits_redundant_sync_note(self):
+        # The "seed" tag already explains why sync is unknown — don't repeat it.
+        p = self._probe(generation=1, lock_date=None, applied="/nix/store/aaa", desired=None)
+        c = agent._check_toolchain(p)
+        assert "seed" in (c.detail or "")
+        assert "sync unknown" not in (c.detail or "")
 
 
 class TestGenerationsToDelete:

@@ -21,7 +21,10 @@ from typing import Any, NoReturn, TextIO
 
 ENGINE = "docker"
 NIX_IMAGE = "docker.io/nixos/nix:latest"
-NIX_BUILD_CACHE_VOLUME = "agent-nix-store"
+NIX_BUILD_CACHE_VOLUME = "agent-buildcache"
+# Its former name — kept only so `agent clean` can reap the leftover after a
+# rename (it borrowed the `agent-nix-` store prefix and read like the real store).
+LEGACY_BUILD_CACHE_VOLUME = "agent-nix-store"
 # The shared, persistent, writeable /nix volume — one per user (from `whoami`),
 # shared across all of that user's repos and stable across image rebuilds. It is
 # root-owned; the toolchain lives here as the default nix profile and is upgraded
@@ -630,6 +633,12 @@ class Probe:
     opencode: str | None
     nofile: str | None  # decimal string, "unlimited", or None
     generation: int | None
+    # Drift detection: `applied` is the store path the default profile points at
+    # now; `desired` is what the *current* flake.lock evaluates to (pure, offline).
+    # `desired is None` means the eval couldn't answer offline (e.g. a seed store
+    # lacking the flake's eval sources) — report "unknown", never a false match.
+    applied: str | None = None
+    desired: str | None = None
     lock_date: str | None = None
 
 
@@ -640,12 +649,14 @@ def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
     update`) toolchain, not the image's baked seed. None if the image isn't built."""
     if not image_exists(engine, image):
         return None
-    vol_mount = ["-v", f"{volume}:/nix"] if _volume_exists(engine, volume) else []
+    have_volume = _volume_exists(engine, volume)
+    vol_mount = ["-v", f"{volume}:/nix"] if have_volume else []
     script = (
         'printf "C:%s\\n" "$(claude --version 2>/dev/null | head -1)"; '
         'printf "O:%s\\n" "$(opencode --version 2>/dev/null | head -1)"; '
         'printf "N:%s\\n" "$(ulimit -Hn)"; '
-        f'printf "G:%s\\n" "$(readlink {DEFAULT_PROFILE} 2>/dev/null)"'
+        f'printf "G:%s\\n" "$(readlink {DEFAULT_PROFILE} 2>/dev/null)"; '
+        f'printf "A:%s\\n" "$(readlink -f {DEFAULT_PROFILE} 2>/dev/null)"'
     )
     r = subprocess.run(
         [engine, "run", "--rm", *vol_mount, image, "sh", "-c", script],
@@ -665,7 +676,26 @@ def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
         opencode=fields.get("O") or None,
         nofile=fields.get("N") or None,
         generation=parse_generation(fields.get("G", "")),
+        applied=fields.get("A") or None,
+        desired=_desired_toolchain(engine, image, volume) if have_volume else None,
     )
+
+
+def _desired_toolchain(engine: str, image: str, volume: str) -> str | None:
+    """The store path the *current* flake.lock evaluates to — pure and offline, as
+    root (taking the store's db lock the `agent` user can't). `--offline` so a seed
+    store lacking the flake's eval sources fails fast rather than hitting the
+    network; a failed/empty eval returns None, read downstream as "sync unknown"
+    (never a false in-sync)."""
+    r = _shared_root(
+        engine,
+        image,
+        volume,
+        "nix eval --raw --offline path:/build#toolchain 2>/dev/null || true",
+        extra_mounts=[f"{SCRIPT_DIR / 'agent-image'}:/build:ro"],
+    )
+    path = r.stdout.strip()
+    return path if path.startswith("/nix/store/") else None
 
 
 def _docker_version(engine: str) -> str:
@@ -759,12 +789,13 @@ def run_doctor(engine: str, image: str, settings: Settings, *, as_json: bool = F
     containers = _run_container_details(engine, settings, image)
     tag_map = _image_tag_map(engine)
     volumes = _agent_volumes(engine)
+    vol_sizes = _volume_sizes(engine)
     current_short = _image_id(engine, image).removeprefix("sha256:")[:12] or None
 
     if as_json:
-        _doctor_json(checks, containers, tag_map, volumes)
+        _doctor_json(checks, containers, tag_map, volumes, vol_sizes)
     else:
-        _doctor_render(checks, containers, tag_map, volumes, current_short)
+        _doctor_render(checks, containers, tag_map, volumes, vol_sizes, current_short, image)
 
     # Only the checks gate the exit code; the container/image/volume inventory is
     # informational and must never trip `agent doctor && …`.
@@ -792,6 +823,24 @@ def _check_toolchain(probe: Probe | None) -> DoctorCheck:
         detail_bits.append("seed")
     elif probe.lock_date:
         detail_bits.append(f"updated {probe.lock_date}")
+
+    # Drift: does the applied store path match what the current flake.lock builds?
+    # `desired is None` means the eval couldn't answer offline — say "sync unknown",
+    # never imply in-sync. A real mismatch is advisory (`warn`), so it can't trip
+    # `agent doctor && …`; the fix is the routine, live-safe `agent update`. On a
+    # gen-1 seed the "seed" tag already explains the unknown, so don't repeat it.
+    if probe.desired is None:
+        if probe.generation != 1:
+            detail_bits.append("sync unknown")
+    elif probe.applied and probe.applied != probe.desired:
+        detail_bits.append("flake.lock ahead")
+        return DoctorCheck(
+            "warn",
+            "toolchain",
+            value,
+            detail=" · ".join(detail_bits),
+            fix="flake.lock is ahead of the store — run `agent update`",
+        )
     return DoctorCheck("ok", "toolchain", value, detail=" · ".join(detail_bits))
 
 
@@ -921,6 +970,30 @@ def _agent_volumes(engine: str) -> list[str]:
     return [n.strip() for n in r.stdout.splitlines() if n.strip().startswith("agent-")]
 
 
+def _volume_sizes(engine: str) -> dict[str, str]:
+    """Human-readable size per agent volume, from one `system df -v` sweep (no
+    per-file `du`). Best-effort: any parse/engine hiccup yields no sizes, and the
+    roster still renders names-only."""
+    r = subprocess.run(
+        [engine, "system", "df", "-v", "--format", "{{json .Volumes}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return {}
+    try:
+        rows = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+    sizes: dict[str, str] = {}
+    for row in rows:
+        name = row.get("Name", "")
+        if name.startswith("agent-") and row.get("Size"):
+            sizes[name] = row["Size"]
+    return sizes
+
+
 def _abbrev_path(p: Path) -> str:
     """`~`-relative, middle-elided to the last two components — enough to tell repos
     apart without a full absolute path."""
@@ -949,7 +1022,9 @@ def _doctor_render(
     containers: list[RunContainer],
     tag_map: dict[str, str],
     volumes: list[str],
+    vol_sizes: dict[str, str],
     current_short: str | None,
+    image: str,
 ) -> None:
     print()
     for c in checks:
@@ -968,7 +1043,7 @@ def _doctor_render(
         if c.why or c.fix_block:
             _doctor_remediation(c)
     _render_tree(containers, tag_map, current_short)
-    _render_volumes(volumes)
+    _render_volumes(volumes, vol_sizes, image)
     _doctor_verdict(checks)
 
 
@@ -1006,17 +1081,35 @@ def _render_tree(
         print("    " + dim(f"{len(containers)} containers — reclaim with `agent stop --all` or `agent clean`"))
 
 
-def _render_volumes(volumes: list[str]) -> None:
-    """One-line roster of this tool's volumes by role, not raw names."""
-    roles = []
-    if any(v.startswith(HOME_VOLUME_PREFIX) for v in volumes):
-        roles.append("home")
-    if nix_shared_volume(getpass.getuser()) in volumes:
-        roles.append("nix-store (shared)")
-    if NIX_BUILD_CACHE_VOLUME in volumes:
-        roles.append("build-cache")
+def _render_volumes(volumes: list[str], vol_sizes: dict[str, str], image: str) -> None:
+    """Roster of this tool's volumes by role (not raw names), each with its disk
+    use, plus the seed relationship — the shared store is a copy of the image's
+    baked /nix, which `agent reset` reseeds and `agent update` mutates in place."""
+    store = nix_shared_volume(getpass.getuser())
+
+    def _role(name: str, label: str) -> str | None:
+        if name not in volumes:
+            return None
+        size = vol_sizes.get(name)
+        return f"{label} {size}" if size else label
+
+    roles = [
+        r
+        for r in (
+            _role(next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), ""), "home"),
+            _role(store, "nix-store (shared)"),
+            _role(NIX_BUILD_CACHE_VOLUME, "build-cache"),
+        )
+        if r
+    ]
     print()
     print("  " + bold("volumes") + "   " + dim(" · ".join(roles) if roles else "none"))
+    if store in volumes:
+        print("    " + dim(f"store seeded from image {image}"))
+    # Don't silently omit the pre-rename cache — it's reclaimable disk, not state.
+    if LEGACY_BUILD_CACHE_VOLUME in volumes:
+        legacy = _role(LEGACY_BUILD_CACHE_VOLUME, "old build-cache")
+        print("    " + dim(f"{legacy} — reclaim with `agent clean`"))
 
 
 def _doctor_remediation(c: DoctorCheck) -> None:
@@ -1051,6 +1144,7 @@ def _doctor_json(
     containers: list[RunContainer],
     tag_map: dict[str, str],
     volumes: list[str],
+    vol_sizes: dict[str, str],
 ) -> None:
     print(
         json.dumps(
@@ -1077,7 +1171,7 @@ def _doctor_json(
                     }
                     for c in containers
                 ],
-                "volumes": volumes,
+                "volumes": [{"name": v, "size": vol_sizes.get(v)} for v in volumes],
             },
             indent=2,
         )
@@ -1543,6 +1637,16 @@ def _reclaim_images(engine: str) -> None:
         _clean_step(
             "Reclaiming build cache",
             [engine, "run", "--rm", "-v", f"{NIX_BUILD_CACHE_VOLUME}:/nix", NIX_IMAGE, "sh", "-c", reclaim],
+        )
+
+    # Drop the pre-rename build cache if it's still lying around. It's a
+    # regenerable cache, so a fresh `agent build`/`update` simply repopulates the
+    # new `agent-buildcache` — no data to migrate, just orphaned disk to reclaim.
+    if _volume_exists(engine, LEGACY_BUILD_CACHE_VOLUME):
+        _clean_step(
+            f"Removing legacy build cache {LEGACY_BUILD_CACHE_VOLUME}",
+            [engine, "volume", "rm", LEGACY_BUILD_CACHE_VOLUME],
+            missing_ok=True,
         )
 
 

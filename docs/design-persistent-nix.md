@@ -44,10 +44,11 @@ implementation choice:
 - **`agent-home-u<uid>g<gid>`** (unchanged) — the per-uid home volume. Holds `~/.elan`'s symlink
   into the store, `~/.local/bin`, caches, etc. Kept on a named volume (not a bind mount) to avoid
   FUSE/VirtioFS open-file limits during Lean builds.
-- **`agent-nix-store`** (kept, repurposed name only) — the build-cache volume used *inside the
-  `nixos/nix` builder*. Its real job is keeping the toolchain closure warm across shared-volume
-  resets and image rebuilds (the shared volume is empty exactly when a seed build runs, so it
-  cannot serve as its own cache). Never mounted by the run container.
+- **`agent-buildcache`** — the build-cache volume used *inside the `nixos/nix` builder*. Its real
+  job is keeping the toolchain closure warm across shared-volume resets and image rebuilds (the
+  shared volume is empty exactly when a seed build runs, so it cannot serve as its own cache).
+  Never mounted by the run container. It sits outside the `agent-nix-` store namespace on purpose,
+  so it never reads as the real store; the former name `agent-nix-store` is reaped by `agent clean`.
 
 ### Ownership and the read-only-consumer rule
 
