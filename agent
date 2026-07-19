@@ -617,20 +617,78 @@ def run_setup() -> None:
     print(f"{_sty('1;32', '✓')} Saved.")
 
 
-def _query_nofile_hard_limit(engine: str, image: str) -> str | None:
-    """Run `ulimit -Hn` inside the agent container.
-    Returns a decimal string, 'unlimited', or None if the image isn't built."""
+@dataclass
+class Probe:
+    """One-shot readings from a throwaway container against the shared /nix store.
+    Toolchain versions and the NOFILE limit are properties of that shared store
+    (mounted into every container), so we read them ONCE here rather than per
+    container. `generation` is the current default-profile generation number;
+    `lock_date` is the host-side date `flake.lock` was last committed (i.e. the
+    last `agent update`)."""
+
+    claude: str | None
+    opencode: str | None
+    nofile: str | None  # decimal string, "unlimited", or None
+    generation: int | None
+    lock_date: str | None = None
+
+
+def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
+    """Read claude/opencode versions, the NOFILE hard limit, and the profile
+    generation in a single throwaway run against the shared store. Mounts the
+    shared /nix volume when it exists so we see the *current* (post-`agent
+    update`) toolchain, not the image's baked seed. None if the image isn't built."""
     if not image_exists(engine, image):
         return None
+    vol_mount = ["-v", f"{volume}:/nix"] if _volume_exists(engine, volume) else []
+    script = (
+        'printf "C:%s\\n" "$(claude --version 2>/dev/null | head -1)"; '
+        'printf "O:%s\\n" "$(opencode --version 2>/dev/null | head -1)"; '
+        'printf "N:%s\\n" "$(ulimit -Hn)"; '
+        f'printf "G:%s\\n" "$(readlink {DEFAULT_PROFILE} 2>/dev/null)"'
+    )
     r = subprocess.run(
-        [engine, "run", "--rm", image, "sh", "-c", "ulimit -Hn"],
+        [engine, "run", "--rm", *vol_mount, image, "sh", "-c", script],
         capture_output=True,
         text=True,
         check=False,
     )
     if r.returncode != 0:
-        die(f"could not query NOFILE limit in agent container:\n{r.stderr.strip() or 'unknown error'}")
-    return r.stdout.strip()
+        die(f"could not probe the agent toolchain:\n{r.stderr.strip() or 'unknown error'}")
+    fields: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        key, _, val = line.partition(":")
+        fields[key] = val.strip()
+    claude_raw = fields.get("C", "")
+    return Probe(
+        claude=claude_raw.split()[0] if claude_raw else None,
+        opencode=fields.get("O") or None,
+        nofile=fields.get("N") or None,
+        generation=parse_generation(fields.get("G", "")),
+    )
+
+
+def _docker_version(engine: str) -> str:
+    r = subprocess.run(
+        [engine, "version", "--format", "{{.Server.Version}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return r.stdout.strip() or "unknown"
+
+
+def _flake_lock_date() -> str | None:
+    """Host-side date `agent-image/flake.lock` was last committed — a reliable
+    proxy for the last `agent update` (in-container profile mtimes are epoch-zeroed
+    by nix2container, so the filesystem can't tell us)."""
+    r = subprocess.run(
+        ["git", "-C", str(SCRIPT_DIR), "log", "-1", "--format=%cs", "--", "agent-image/flake.lock"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return r.stdout.strip() or None
 
 
 _NOFILE_FIX_DOCKER_DARWIN = r"""# Open Docker Desktop → Settings → Docker Engine and merge into the JSON:
@@ -688,89 +746,77 @@ def run_doctor(engine: str, image: str, settings: Settings, *, as_json: bool = F
     """Environment health. Collect every check, then render once (text or JSON).
     Exit 1 iff any check is `fail` (a blocking problem); `warn`/`info` stay exit 0
     so `agent doctor && …` and CI aren't tripped by advisory hints."""
+    volume = nix_shared_volume(getpass.getuser())
+    probe = _probe_toolchain(engine, image, volume)
+    if probe is not None:
+        probe.lock_date = _flake_lock_date()
+
     checks = [
-        DoctorCheck("ok", "docker", "running"),
-        _check_run_container(engine, image, settings),
-        _check_pileup(engine),
-        _check_nofile(engine, image),
+        DoctorCheck("ok", "docker", "running", detail=f"v{_docker_version(engine)}"),
+        _check_toolchain(probe),
+        _check_nofile(probe.nofile if probe else None),
     ]
-    checks = [c for c in checks if c is not None]
+    containers = _run_container_details(engine, settings, image)
+    tag_map = _image_tag_map(engine)
+    volumes = _agent_volumes(engine)
+    current_short = _image_id(engine, image).removeprefix("sha256:")[:12] or None
 
     if as_json:
-        _doctor_json(checks)
+        _doctor_json(checks, containers, tag_map, volumes)
     else:
-        _doctor_render(checks)
+        _doctor_render(checks, containers, tag_map, volumes, current_short)
 
+    # Only the checks gate the exit code; the container/image/volume inventory is
+    # informational and must never trip `agent doctor && …`.
     if any(c.status == "fail" for c in checks):
         sys.exit(1)
 
 
-def _check_run_container(engine: str, image: str, settings: Settings) -> DoctorCheck:
-    """This repo's persistent container: absent, or running/stopped and up-to-date vs
-    config-changed. `config changed` predicts the next call recreates — computed from
-    the same `build_run_spec` the run path uses, so the verdict can't drift from reality."""
-    mount_root = resolve_mount_root(settings)
-    name = run_container_name(mount_root)
-    state = _inspect_run_container(engine, name)
-    if state is None:
-        return DoctorCheck("ok", "container", "none yet", note="created on first run")
-    running, stored_fp = state
-    run_state = "running" if running else "stopped"
-    fresh = stored_fp == build_run_spec(engine, settings, image, mount_root).fingerprint
-    if fresh:
-        return DoctorCheck("ok", "container", f"{run_state}, up to date", detail=name)
-    # Self-healing (auto-recreates when safe), so info/cyan — not a yellow "you must act".
-    if running:
-        note = "session active; next call joins it instead of rebuilding"
-    else:
-        note = "rebuilds on next call"
-    return DoctorCheck("info", "container", f"{run_state}, config changed", detail=name, note=note)
+def _check_toolchain(probe: Probe | None) -> DoctorCheck:
+    """The shared toolchain: claude/opencode versions, plus the profile generation
+    and last-update date. One reading for the whole install (the store is shared)."""
+    if probe is None:
+        return DoctorCheck("info", "toolchain", "not checked", note="run `agent build` first")
+    parts = []
+    if probe.claude:
+        parts.append(f"claude {probe.claude}")
+    if probe.opencode:
+        parts.append(f"opencode {probe.opencode}")
+    value = " · ".join(parts) if parts else "unknown"
+    detail_bits = []
+    if probe.generation is not None:
+        detail_bits.append(f"gen {probe.generation}")
+    # Generation 1 is the image's baked seed — no `agent update` has run, so there
+    # is no update date to show (the flake.lock date would misreport "updated").
+    if probe.generation == 1:
+        detail_bits.append("seed")
+    elif probe.lock_date:
+        detail_bits.append(f"updated {probe.lock_date}")
+    return DoctorCheck("ok", "toolchain", value, detail=" · ".join(detail_bits))
 
 
-def _check_pileup(engine: str) -> DoctorCheck | None:
-    """All-repos `agent-run-*` count. Hidden at ≤1 (no pile beyond this repo);
-    informational up to the threshold, then a warn hinting how to reclaim."""
-    count = len(_list_run_containers(engine))
-    if count <= 1:
-        return None
-    if count >= RUN_PILEUP_WARN:
-        return DoctorCheck(
-            "warn",
-            "all containers",
-            f"{count} containers",
-            fix="agent stop --all  ·  or  agent clean",
-        )
-    return DoctorCheck("info", "all containers", f"{count} containers")
-
-
-def _check_nofile(engine: str, image: str) -> DoctorCheck:
+def _check_nofile(nofile: str | None) -> DoctorCheck:
+    """NOFILE hard limit, already read by the shared-store probe. `ample`/`too low`
+    reads as a verdict on its own — the bare number alone said nothing."""
     warn_at = 1024
     recommended = 524288
-    raw = _query_nofile_hard_limit(engine, image)
-    if raw is None:
-        return DoctorCheck(
-            "info",
-            "open files",
-            "not checked",
-            note="run `agent build` to check",
-        )
-    detail = "ulimit inside container"
-    if raw == "unlimited":
-        return DoctorCheck("ok", "open files", "unlimited", detail=detail)
+    if nofile is None:
+        return DoctorCheck("info", "open files", "not checked", note="run `agent build` first")
+    if nofile == "unlimited":
+        return DoctorCheck("ok", "open files", "unlimited", detail="ample")
     try:
-        limit = int(raw)
+        limit = int(nofile)
     except ValueError:
-        die(f"unexpected NOFILE value from agent container: {raw!r}")
+        die(f"unexpected NOFILE value from agent container: {nofile!r}")
     if limit > warn_at:
-        return DoctorCheck("ok", "open files", str(limit), detail=detail)
+        return DoctorCheck("ok", "open files", str(limit), detail="ample")
     where = "Docker Desktop settings" if sys.platform == "darwin" else "docker daemon.json"
     # `nofile` stays literal: it's the actual daemon `default-ulimits` config key.
     return DoctorCheck(
         "fail",
         "open files",
         str(limit),
-        detail=detail,
-        note=f"too low — want {recommended}",
+        detail=f"too low — want ≥{recommended}",
         fix=f"raise the nofile ulimit in {where}, then rebuild",
         why=[
             "The 1024 hard cap is a systemd default, kept for select(2) safety.",
@@ -780,7 +826,131 @@ def _check_nofile(engine: str, image: str) -> DoctorCheck:
     )
 
 
-def _doctor_render(checks: list[DoctorCheck]) -> None:
+@dataclass
+class RunContainer:
+    """A persistent `agent-run-*` container, with just enough to place it in the
+    image→container tree and say whether the next call would recreate it."""
+
+    name: str
+    running: bool
+    image_short: str
+    path: Path | None
+    fresh: bool | None  # None when the mounted repo path couldn't be recovered
+
+
+def _run_container_details(engine: str, settings: Settings, image: str) -> list[RunContainer]:
+    """Inspect every persistent container for this user. Freshness reuses the run
+    path's `build_run_spec` fingerprint, so `up to date`/`config drift` predicts the
+    next call exactly. The repo path is the one bind whose source == destination."""
+    out: list[RunContainer] = []
+    fmt = (
+        "{{.State.Running}}\t{{.Image}}\t"
+        '{{index .Config.Labels "agent.fingerprint"}}\t'
+        "{{range .Mounts}}{{.Source}}={{.Destination}};{{end}}"
+    )
+    for name in _list_run_containers(engine):
+        r = subprocess.run(
+            [engine, "inspect", "--format", fmt, name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            continue
+        running_s, _, rest = r.stdout.rstrip("\n").partition("\t")
+        img, _, rest = rest.partition("\t")
+        stored_fp, _, mounts_s = rest.partition("\t")
+        path = _repo_mount_path(mounts_s)
+        fresh: bool | None = None
+        if path is not None:
+            fresh = stored_fp == build_run_spec(engine, settings, image, path).fingerprint
+        out.append(
+            RunContainer(
+                name=name,
+                running=running_s == "true",
+                image_short=img.removeprefix("sha256:")[:12],
+                path=path,
+                fresh=fresh,
+            )
+        )
+    return out
+
+
+def _repo_mount_path(mounts_s: str) -> Path | None:
+    """The repo bind is the one mounted at the same path inside as out
+    (`{root}:{root}`). Docker Desktop may prefix the host source with `/host_mnt`,
+    so compare against that stripped too. The destination IS the repo path."""
+    for m in mounts_s.split(";"):
+        src, _, dst = m.partition("=")
+        if not (src and dst):
+            continue
+        normalized = src.removeprefix("/host_mnt")
+        if dst in (src, normalized):
+            return Path(dst)
+    return None
+
+
+def _image_tag_map(engine: str) -> dict[str, str]:
+    """Short image id → an `agent:*` tag. A rebuilt image leaves old containers
+    pointing at a now-untagged id, so not every container resolves to a tag."""
+    r = subprocess.run(
+        [engine, "images", "agent", "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    tag_map: dict[str, str] = {}
+    current = f"agent:u{os.getuid()}g{os.getgid()}"
+    for line in r.stdout.splitlines():
+        iid, _, tag = line.partition("\t")
+        if not iid:
+            continue
+        # Prefer the current per-user tag when an id carries several.
+        if iid not in tag_map or tag == current:
+            tag_map[iid] = tag
+    return tag_map
+
+
+def _agent_volumes(engine: str) -> list[str]:
+    r = subprocess.run(
+        [engine, "volume", "ls", "--format", "{{.Name}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return [n.strip() for n in r.stdout.splitlines() if n.strip().startswith("agent-")]
+
+
+def _abbrev_path(p: Path) -> str:
+    """`~`-relative, middle-elided to the last two components — enough to tell repos
+    apart without a full absolute path."""
+    try:
+        s = "~/" + str(p.relative_to(Path.home()))
+    except ValueError:
+        s = str(p)
+    parts = s.split("/")
+    if len(parts) > 3:
+        s = parts[0] + "/…/" + "/".join(parts[-2:])
+    return s
+
+
+def _container_status(c: RunContainer) -> str:
+    if not c.running:
+        return dim("stopped")
+    if c.fresh is False:
+        return cyan("config drift")
+    if c.fresh is True:
+        return dim("up to date")
+    return dim("running")
+
+
+def _doctor_render(
+    checks: list[DoctorCheck],
+    containers: list[RunContainer],
+    tag_map: dict[str, str],
+    volumes: list[str],
+    current_short: str | None,
+) -> None:
     print()
     for c in checks:
         glyph, colour = _DOCTOR_GLYPH[c.status]
@@ -797,7 +967,56 @@ def _doctor_render(checks: list[DoctorCheck]) -> None:
         print(line)
         if c.why or c.fix_block:
             _doctor_remediation(c)
+    _render_tree(containers, tag_map, current_short)
+    _render_volumes(volumes)
     _doctor_verdict(checks)
+
+
+def _render_tree(
+    containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None
+) -> None:
+    """Group containers under the image they were built from — the derivation at a
+    glance. Containers on a rebuilt image show as an untagged id. The current image
+    is always listed (even with no containers) so a fully-drifted set is visible."""
+    print()
+    print("  " + bold("images & containers"))
+    groups: dict[str, list[RunContainer]] = {}
+    if current_short:
+        groups[current_short] = []
+    for c in containers:
+        groups.setdefault(c.image_short, []).append(c)
+    if not groups:
+        print("    " + dim("none yet"))
+        return
+    for image_short, members in groups.items():
+        tag = tag_map.get(image_short)
+        header = cyan(tag) if tag else f"{image_short} {dim('(untagged)')}"
+        if image_short == current_short:
+            header += dim("  (current)")
+        print("    " + header)
+        if not members:
+            print(f"      {dim('└─ no containers')}")
+            continue
+        for i, c in enumerate(members):
+            connector = "└─" if i == len(members) - 1 else "├─"
+            glyph = green("●") if c.running else dim("○")
+            label = _abbrev_path(c.path) if c.path else c.name
+            print(f"      {dim(connector)} {glyph} {label.ljust(32)}{_container_status(c)}")
+    if len(containers) >= RUN_PILEUP_WARN:
+        print("    " + dim(f"{len(containers)} containers — reclaim with `agent stop --all` or `agent clean`"))
+
+
+def _render_volumes(volumes: list[str]) -> None:
+    """One-line roster of this tool's volumes by role, not raw names."""
+    roles = []
+    if any(v.startswith(HOME_VOLUME_PREFIX) for v in volumes):
+        roles.append("home")
+    if nix_shared_volume(getpass.getuser()) in volumes:
+        roles.append("nix-store (shared)")
+    if NIX_BUILD_CACHE_VOLUME in volumes:
+        roles.append("build-cache")
+    print()
+    print("  " + bold("volumes") + "   " + dim(" · ".join(roles) if roles else "none"))
 
 
 def _doctor_remediation(c: DoctorCheck) -> None:
@@ -827,20 +1046,39 @@ def _doctor_verdict(checks: list[DoctorCheck]) -> None:
         print(f"  {green('✓')}  {green(f'all {n} checks passed')}")
 
 
-def _doctor_json(checks: list[DoctorCheck]) -> None:
+def _doctor_json(
+    checks: list[DoctorCheck],
+    containers: list[RunContainer],
+    tag_map: dict[str, str],
+    volumes: list[str],
+) -> None:
     print(
         json.dumps(
-            [
-                {
-                    "check": c.label,
-                    "status": c.status,
-                    "value": c.value,
-                    "detail": c.detail or None,
-                    "note": c.note or None,
-                    "fix": c.fix or None,
-                }
-                for c in checks
-            ],
+            {
+                "checks": [
+                    {
+                        "check": c.label,
+                        "status": c.status,
+                        "value": c.value,
+                        "detail": c.detail or None,
+                        "note": c.note or None,
+                        "fix": c.fix or None,
+                    }
+                    for c in checks
+                ],
+                "containers": [
+                    {
+                        "name": c.name,
+                        "running": c.running,
+                        "image": c.image_short,
+                        "image_tag": tag_map.get(c.image_short),
+                        "path": str(c.path) if c.path else None,
+                        "up_to_date": c.fresh,
+                    }
+                    for c in containers
+                ],
+                "volumes": volumes,
+            },
             indent=2,
         )
     )
