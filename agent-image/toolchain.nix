@@ -114,6 +114,7 @@ let
         openssh
         poppler-utils
         procps
+        psutils
         (python3.withPackages (ps: [ ps.pygments ]))
         ripgrep
         ruff
