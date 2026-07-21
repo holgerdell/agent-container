@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import concurrent.futures
 import contextlib
 import fcntl
 import getpass
@@ -16,6 +17,7 @@ import termios
 import tty
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 
@@ -646,7 +648,12 @@ def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
     """Read claude/opencode versions, the NOFILE hard limit, and the profile
     generation in a single throwaway run against the shared store. Mounts the
     shared /nix volume when it exists so we see the *current* (post-`agent
-    update`) toolchain, not the image's baked seed. None if the image isn't built."""
+    update`) toolchain, not the image's baked seed. None if the image isn't built.
+
+    Does *not* compute `desired` (the flake-drift eval) — `run_doctor` runs that as
+    a separate concurrent task so probe + eval don't serialize. Runs `die()`-free so
+    it's safe in a worker thread: a probe failure returns None (the check degrades to
+    "not checked", exactly like an absent image)."""
     if not image_exists(engine, image):
         return None
     have_volume = _volume_exists(engine, volume)
@@ -659,13 +666,18 @@ def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
         f'printf "A:%s\\n" "$(readlink -f {DEFAULT_PROFILE} 2>/dev/null)"'
     )
     r = subprocess.run(
-        [engine, "run", "--rm", *vol_mount, image, "sh", "-c", script],
+        # `--pull=never`: the image is already present (guarded above), so this
+        # read never reaches a registry — the offline guarantee, made explicit and
+        # refactor-proof rather than resting on the implicit `image_exists` guard.
+        [engine, "run", "--rm", "--pull=never", *vol_mount, image, "sh", "-c", script],
         capture_output=True,
         text=True,
         check=False,
     )
     if r.returncode != 0:
-        die(f"could not probe the agent toolchain:\n{r.stderr.strip() or 'unknown error'}")
+        # No `die()`: this runs in a doctor worker thread, where a `SystemExit`
+        # would abort the whole report. Degrade to "not checked" like an absent image.
+        return None
     fields: dict[str, str] = {}
     for line in r.stdout.splitlines():
         key, _, val = line.partition(":")
@@ -677,7 +689,6 @@ def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
         nofile=fields.get("N") or None,
         generation=parse_generation(fields.get("G", "")),
         applied=fields.get("A") or None,
-        desired=_desired_toolchain(engine, image, volume) if have_volume else None,
     )
 
 
@@ -796,30 +807,75 @@ class DoctorCheck:
     fix_block: str = ""
 
 
+def _safe_result[T](future: concurrent.futures.Future[T], default: T) -> T:
+    """Read one doctor collection future, degrading any failure to `default` so a
+    single broken read renders as "unavailable" instead of aborting the whole
+    report. A worker's exception is stored on the future and re-raised here by
+    `.result()`; catching `SystemExit` alongside `Exception` contains any `die()`
+    reachable from a worker (a `BaseException` that `except Exception` would miss,
+    letting it kill the doctor — the exact failure isolation is meant to prevent).
+    `KeyboardInterrupt` still propagates."""
+    try:
+        return future.result()
+    except (Exception, SystemExit):
+        return default
+
+
 def run_doctor(engine: str, image: str, settings: Settings, *, as_json: bool = False) -> None:
-    """Environment health. Collect every check, then render once (text or JSON).
-    Exit 1 iff any check is `fail` (a blocking problem); `warn`/`info` stay exit 0
-    so `agent doctor && …` and CI aren't tripped by advisory hints."""
+    """Environment health. Collect every read concurrently, then render once (text
+    or JSON). The reads are subprocess/IO-bound (docker/nix/git), so a thread pool
+    collapses the three slow serial calls — the shared-store probe, the flake-drift
+    eval, and the `system df -v` volume sweep — into a single wall-clock wait (~2x
+    faster warm). Each read is isolated (see `_safe_result`): a failure degrades
+    that one line, never the whole report. Exit 1 iff any check is `fail` (a blocking
+    problem); `warn`/`info` stay exit 0 so `agent doctor && …` and CI aren't
+    tripped by advisory hints."""
     volume = nix_shared_volume(getpass.getuser())
-    probe = _probe_toolchain(engine, image, volume)
+    # Guard the store-touching reads once, up front: with no built image there's
+    # nothing to probe, and mounting an absent /nix volume would make docker create
+    # an empty one as a side effect. Both degrade to "not checked".
+    img_ok = image_exists(engine, image)
+    have_volume = img_ok and _volume_exists(engine, volume)
+
+    # Raw reads submitted so ty infers each `Future[…]` cleanly; `_safe_result`
+    # extracts them after join.
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        f_probe = ex.submit(_probe_toolchain, engine, image, volume) if img_ok else None
+        f_desired = ex.submit(_desired_toolchain, engine, image, volume) if have_volume else None
+        f_version = ex.submit(_docker_version, engine)
+        f_containers = ex.submit(_run_container_details, engine, settings, image)
+        f_tag_map = ex.submit(_image_tag_map, engine)
+        f_volumes = ex.submit(_agent_volumes, engine)
+        f_vol_sizes = ex.submit(_volume_sizes, engine)
+        f_image_id = ex.submit(_image_id, engine, image)
+        f_ages = ex.submit(_image_ages, engine)
+        f_lock_date = ex.submit(_flake_lock_date)
+
+    probe = _safe_result(f_probe, None) if f_probe else None
     if probe is not None:
-        probe.lock_date = _flake_lock_date()
+        # Merge the separately-collected drift eval and lock date onto the probe.
+        probe.desired = _safe_result(f_desired, None) if f_desired else None
+        probe.lock_date = _safe_result(f_lock_date, None)
 
     checks = [
-        DoctorCheck("ok", "docker", "running", detail=f"v{_docker_version(engine)}"),
+        DoctorCheck("ok", "docker", "running", detail=f"v{_safe_result(f_version, 'unknown')}"),
         _check_toolchain(probe),
+        # `_check_nofile` runs here in the main thread on purpose: an unexpected
+        # NOFILE value is a genuine `die()`, and must stay fatal — not be swallowed
+        # by a worker's error isolation.
         _check_nofile(probe.nofile if probe else None),
     ]
-    containers = _run_container_details(engine, settings, image)
-    tag_map = _image_tag_map(engine)
-    volumes = _agent_volumes(engine)
-    vol_sizes = _volume_sizes(engine)
-    current_short = _image_id(engine, image).removeprefix("sha256:")[:12] or None
+    containers = _safe_result(f_containers, [])
+    tag_map = _safe_result(f_tag_map, {})
+    volumes = _safe_result(f_volumes, [])
+    vol_sizes = _safe_result(f_vol_sizes, {})
+    current_short = _safe_result(f_image_id, "").removeprefix("sha256:")[:12] or None
+    ages = _safe_result(f_ages, {})
 
     if as_json:
         _doctor_json(checks, containers, tag_map, volumes, vol_sizes)
     else:
-        _doctor_render(checks, containers, tag_map, volumes, vol_sizes, current_short, image)
+        _doctor_render(checks, containers, tag_map, volumes, vol_sizes, current_short, ages)
 
     # Only the checks gate the exit code; the container/image/volume inventory is
     # informational and must never trip `agent doctor && …`.
@@ -857,14 +913,14 @@ def _check_toolchain(probe: Probe | None) -> DoctorCheck:
         if probe.generation != 1:
             detail_bits.append("sync unknown")
     elif probe.applied and probe.applied != probe.desired:
-        # "flake.lock ahead" is the warn *reason*, carried by the fix line (rendered on
-        # its own continuation row) — not repeated in the neutral detail column.
+        # The drift reason is the warn's advisory item (dejargoned — no `flake.lock`/nix
+        # in the user-facing text); the neutral detail column stays clean.
         return DoctorCheck(
             "warn",
             "toolchain",
             value,
             detail=" · ".join(detail_bits),
-            fix="flake.lock ahead — run `agent update`",
+            fix="a newer toolchain is ready — run `agent update`",
         )
     return DoctorCheck("ok", "toolchain", value, detail=" · ".join(detail_bits))
 
@@ -985,6 +1041,72 @@ def _image_tag_map(engine: str) -> dict[str, str]:
     return tag_map
 
 
+def _image_ages(engine: str) -> dict[str, int]:
+    """Short image id → local tag time (epoch seconds), from `.Metadata.LastTagTime`.
+    The nix image bakes `.Created` to the epoch (reproducible builds), so `.Created`
+    reads as "56 years ago" — useless. LastTagTime is when `agent build` tagged the
+    image on *this* host, which is the real "built …" age we want to show."""
+    r = subprocess.run(
+        [engine, "images", "agent", "--format", "{{.ID}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    ids = [x.strip() for x in r.stdout.splitlines() if x.strip()]
+    if not ids:
+        return {}
+    ri = subprocess.run(
+        [engine, "image", "inspect", "--format", "{{.Id}}\t{{.Metadata.LastTagTime}}", *ids],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    ages: dict[str, int] = {}
+    for line in ri.stdout.splitlines():
+        iid, _, ts = line.partition("\t")
+        epoch = _parse_docker_time(ts.strip())
+        if iid and epoch is not None:
+            ages[iid.removeprefix("sha256:")[:12]] = epoch
+    return ages
+
+
+_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
+
+
+def _parse_docker_time(s: str) -> int | None:
+    """Epoch seconds from a docker timestamp, tolerating both forms it renders across
+    versions/engines: ISO (`2026-07-19T03:02:54.88Z`) and Go's `time.Time` string
+    (`2026-07-19 03:02:54.88 +0000 UTC`). Sub-second and offset are dropped — age is
+    only ever shown to minute granularity, and these times are UTC in practice."""
+    m = _TIME_RE.search(s)
+    if not m:
+        return None
+    y, mo, d, h, mi, sec = (int(x) for x in m.groups())
+    try:
+        return int(datetime(y, mo, d, h, mi, sec, tzinfo=UTC).timestamp())
+    except ValueError:
+        return None
+
+
+def _rel_age(epoch: int | None) -> str:
+    """Compact relative age (`4h ago`, `3d ago`) from an epoch, or "" when unknown."""
+    if not epoch:
+        return ""
+    mins = (datetime.now(UTC).timestamp() - epoch) / 60
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{int(mins)}m ago"
+    if mins < 60 * 24:
+        return f"{int(mins / 60)}h ago"
+    days = mins / (60 * 24)
+    if days < 14:
+        return f"{int(days)}d ago"
+    if days < 60:
+        return f"{int(days / 7)}w ago"
+    return f"{int(days / 30)}mo ago"
+
+
 def _agent_volumes(engine: str) -> list[str]:
     r = subprocess.run(
         [engine, "volume", "ls", "--format", "{{.Name}}"],
@@ -1051,36 +1173,41 @@ def _doctor_render(
     volumes: list[str],
     vol_sizes: dict[str, str],
     current_short: str | None,
-    image: str,
+    ages: dict[str, int],
 ) -> None:
+    # Routine state up top (one line), the inventory in the middle, and every problem
+    # collected into a single advisory section at the bottom — shown only when there
+    # is something to act on. The checks still gate the exit code upstream.
     print()
-    # Align the detail column across checks: pad every value to the widest one so
-    # `v29.6.1` / `gen 3 …` / `ample` start at the same column and scan vertically.
-    val_w = max((len(c.value) for c in checks), default=0)
-    detail_indent = "  " + " " + "  " + " " * _DOCTOR_LABEL_W  # under the value column
-    for c in checks:
-        glyph, colour = _DOCTOR_GLYPH[c.status]
-        value = dim(c.value) if c.status in ("ok", "info") else colour(c.value)
-        line = f"  {colour(glyph)}  {c.label.ljust(_DOCTOR_LABEL_W)}{_col(value, val_w)}"
-        if c.detail:
-            line += f"   {dim(c.detail)}"
-        if c.note:
-            line += f"  {dim('(' + c.note + ')')}"
-        print(line)
-        # A one-command fix drops to its own row under the value column (the warn
-        # reason). The multi-line block (why/fix_block, fail only) is a separate path.
-        if c.fix and not c.fix_block:
-            print(detail_indent + dim(c.fix))
-        if c.why or c.fix_block:
-            _doctor_remediation(c)
-    _render_tree(containers, tag_map, current_short)
-    _render_volumes(volumes, vol_sizes, image)
-    reclaimable = vol_sizes.get(LEGACY_BUILD_CACHE_VOLUME) if LEGACY_BUILD_CACHE_VOLUME in volumes else None
-    _doctor_verdict(checks, containers, reclaimable)
+    _doctor_header(checks)
+    _render_tree(containers, tag_map, current_short, ages)
+    _render_volumes(volumes, vol_sizes)
+    _doctor_matrix(containers, tag_map, volumes, current_short)
+    _doctor_advisory(checks, containers, volumes, vol_sizes)
+
+
+def _doctor_header(checks: list[DoctorCheck]) -> None:
+    """The always-fine facts folded into one line — the docker engine version and the
+    shared toolchain identity. This is not a checklist: anything that needs action is
+    surfaced in the advisory section, never here."""
+    by_label = {c.label: c for c in checks}
+    parts = []
+    docker = by_label.get("docker")
+    if docker:
+        parts.append(f"docker {docker.detail}".strip())
+    tc = by_label.get("toolchain")
+    if tc:
+        if tc.status == "info":  # "not checked" — no image yet
+            parts.append(f"toolchain {tc.value}")
+        else:
+            gen = next((b for b in (tc.detail or "").split(" · ") if b.startswith("gen ")), "")
+            suffix = f" ({gen})" if gen else ""
+            parts.append(f"toolchain {tc.value.replace(' · ', ', ')}{suffix}")
+    print("  " + dim("Using " + "  ·  ".join(parts)))
 
 
 def _render_tree(
-    containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None
+    containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None, ages: dict[str, int]
 ) -> None:
     """Group containers under the image they were built from — the derivation at a
     glance. Containers on a rebuilt image show as an untagged id. The current image
@@ -1096,14 +1223,17 @@ def _render_tree(
         print("    " + dim("none yet"))
         return
     for image_short, members in groups.items():
-        # Consistent identity: the current image by its stable tag (`agent:u501g20`);
-        # any other image a container still sits on is a superseded build, shown by a
-        # short id — never its raw nix content tag (`agent:4zccz…`), which is noise.
+        # Unambiguous identity (maps straight to `docker images`): the current image by
+        # its stable tag (`agent:u501g20`); any other image a container still sits on is
+        # a superseded build, shown by a full 12-char id — never its raw nix content tag
+        # (`agent:4zccz…`), which is noise. Age is the local tag time (see `_image_ages`).
+        age = _rel_age(ages.get(image_short))
+        built = f" · built {age}" if age else ""
         if image_short == current_short:
-            handle = tag_map.get(image_short) or image_short[:6]
-            header = cyan(handle) + dim("   ·  current build")
+            handle = tag_map.get(image_short) or image_short[:12]
+            header = cyan(handle) + dim(f"   ·  current build{built}")
         else:
-            header = image_short[:6] + dim("   ·  superseded build")
+            header = image_short[:12] + dim(f"   ·  superseded build{built}")
         print("    " + header)
         if not members:
             print(f"      {dim('└─ no containers')}")
@@ -1117,87 +1247,137 @@ def _render_tree(
         print("    " + dim(f"{len(containers)} containers — reclaim with `agent stop --all` or `agent clean`"))
 
 
-def _render_volumes(volumes: list[str], vol_sizes: dict[str, str], image: str) -> None:
-    """Roster of this tool's volumes by role (not raw names), one aligned row each:
-    role · size · note. The shared store is a copy of the image's baked /nix (`agent
-    reset` reseeds, `agent update` mutates in place); the pre-rename cache is stale
-    reclaimable disk, never silently omitted."""
-    store = nix_shared_volume(getpass.getuser())
-    home = next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), "")
-    # (name, label, note) in display order; only those present render.
-    spec = [
-        (home, "home", ""),
-        (store, "nix-store (shared)", f"seeded from {image}"),
-        (NIX_BUILD_CACHE_VOLUME, "build-cache", ""),
-        (LEGACY_BUILD_CACHE_VOLUME, "build-cache (old)", "reclaim with `agent clean`"),
-    ]
-    rows = [
-        (label, _fmt_size(vol_sizes.get(name)), note) for name, label, note in spec if name in volumes
-    ]
+def _render_volumes(volumes: list[str], vol_sizes: dict[str, str]) -> None:
+    """Roster of this tool's volumes by their real docker name (so each row maps
+    straight to `docker volume ls`) and size, one aligned row each. Ordered by role;
+    what each command would do to them lives in the maintenance-impact matrix below,
+    so no per-row notes are repeated here."""
+    order = _volume_order(volumes)
+    rows = [(name, _fmt_size(vol_sizes.get(name))) for name in order]
     print()
     print("  " + bold("volumes"))
     if not rows:
         print("    " + dim("none"))
         return
-    label_w = max(len(label) for label, _, _ in rows)
-    size_w = max((len(size) for _, size, _ in rows), default=0)
-    for label, size, note in rows:
-        line = "    " + label.ljust(label_w) + "  " + dim(size.rjust(size_w))
-        if note:
-            line += "   " + dim(note)
-        print(line)
+    name_w = max(len(name) for name, _ in rows)
+    size_w = max((len(size) for _, size in rows), default=0)
+    for name, size in rows:
+        print("    " + name.ljust(name_w) + "  " + dim(size.rjust(size_w)))
 
 
-def _plural(n: int, one: str, many: str) -> str:
-    return one if n == 1 else many
+def _volume_order(volumes: list[str]) -> list[str]:
+    """Present agent volumes in a stable role order (home, shared store, build cache,
+    legacy cache), then any others, so the roster and the matrix line up row-for-row."""
+    store = nix_shared_volume(getpass.getuser())
+    home = next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), "")
+    preferred = [home, store, NIX_BUILD_CACHE_VOLUME, LEGACY_BUILD_CACHE_VOLUME]
+    ordered = [v for v in preferred if v in volumes]
+    ordered += [v for v in volumes if v not in ordered]
+    return ordered
 
 
-def _doctor_remediation(c: DoctorCheck) -> None:
-    arrow = red("→")
-    print()
-    print(f"  {arrow} {bold('Why it matters')}")
-    for line in c.why:
-        print("    " + dim(line))
-    if c.fix_block:
-        print()
-        print(f"  {arrow} {bold('Fix')} {dim('— ' + c.fix)}")
-        print()
-        _doctor_block(c.fix_block)
-    print()
+_MATRIX_COLS = ("update", "build", "clean")
 
 
-def _doctor_verdict(
-    checks: list[DoctorCheck], containers: list[RunContainer], reclaimable: str | None
+def _doctor_matrix(
+    containers: list[RunContainer], tag_map: dict[str, str], volumes: list[str], current_short: str | None
 ) -> None:
-    """One closing line: the check verdict, then any actionable inventory (containers
-    that will recreate, disk that can be reclaimed). Only the checks gate the exit code
-    upstream — the inventory items are advisory and never change it."""
-    n = len(checks)
-    fails = sum(c.status == "fail" for c in checks)
-    warns = sum(c.status == "warn" for c in checks)
-    recreate = sum(1 for c in containers if c.fresh is False)
+    """What each maintenance command would do to every artifact, one row each. Computed
+    from the *current* state, never a guess: `agent clean` leaves images pinned by a
+    live (running) session, so an image's clean effect is read off what is running —
+    keeping the destination's promise that no shown fact is misleading. `—` = no
+    effect. Command semantics: `build` reseeds the current image; `update` writes the
+    shared store (and build cache) in place; `clean` removes stopped run containers,
+    unused images, the legacy cache, and trims the shared store."""
+    running_imgs = {c.image_short for c in containers if c.running}
+    rows: list[tuple[str, tuple[str, str, str]]] = []
 
-    inventory = []
-    if recreate:
-        verb = _plural(recreate, "recreates", "recreate")
-        inventory.append(f"{recreate} {_plural(recreate, 'container', 'containers')} {verb} next run")
-    if reclaimable:
-        inventory.append(f"{_fmt_size(reclaimable, round_int=True)} reclaimable")
+    if current_short:
+        label = tag_map.get(current_short) or current_short[:12]
+        rows.append((label, ("—", "rebuild", "keep" if current_short in running_imgs else "remove")))
+    seen = {current_short}
+    for c in containers:
+        if c.image_short in seen:
+            continue
+        seen.add(c.image_short)
+        rows.append((c.image_short[:12], ("—", "—", "keep" if c.image_short in running_imgs else "remove")))
 
-    if fails:
-        glyph, lead = red("✗"), red(f"{fails} need attention")
-    elif warns:
-        glyph, lead = yellow("!"), yellow(f"{warns} advisory")
-    elif inventory:
-        # Checks are clean but there's something to act on — flag it, and say "checks ok"
-        # rather than "all passed" so the ! doesn't read as contradicting the lead.
-        glyph, lead = yellow("!"), green("checks ok")
-    else:
-        glyph, lead = green("✓"), green(f"all {n} checks passed")
+    store = nix_shared_volume(getpass.getuser())
+    home = next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), "")
+    vol_effects = {
+        home: ("—", "—", "—"),
+        store: ("write", "—", "trim"),
+        NIX_BUILD_CACHE_VOLUME: ("write", "write", "reclaim"),
+        LEGACY_BUILD_CACHE_VOLUME: ("—", "—", "remove"),
+    }
+    for name in _volume_order(volumes):
+        rows.append((name, vol_effects.get(name, ("—", "—", "—"))))
 
-    parts = [lead, *(dim(p) for p in inventory)]
+    # Omit no-ops (point 5): drop any artifact every command leaves untouched (e.g.
+    # `home`), so every row shown is one a command actually acts on.
+    rows = [row for row in rows if any(e != "—" for e in row[1])]
+    if not rows:
+        return
     print()
-    print(f"  {glyph}  " + dim("  ·  ").join(parts))
+    print("  " + bold("maintenance impact"))
+    label_w = max(len(label) for label, _ in rows)
+    cell_w = max(len("rebuild"), *(len(x) for x in _MATRIX_COLS)) + 2
+    print(("    " + " " * label_w + "  " + dim("".join(c.ljust(cell_w) for c in _MATRIX_COLS))).rstrip())
+    for label, effects in rows:
+        cells = "".join((dim(x) if x == "—" else x) + " " * (cell_w - len(x)) for x in effects)
+        print(("    " + label.ljust(label_w) + "  " + cells).rstrip())
+
+
+def _doctor_advisory(
+    checks: list[DoctorCheck], containers: list[RunContainer], volumes: list[str], vol_sizes: dict[str, str]
+) -> None:
+    """The single bottom section — shown only when something needs attention, each item
+    in plain language with its fix. It never gates the exit code (the checks upstream
+    do); it only re-presents their advisory/fail signals plus the actionable inventory,
+    deduped so nothing appears both here and as a check row. All clear → one line."""
+    by_label = {c.label: c for c in checks}
+    items: list[tuple[list[str], str]] = []  # (paragraph lines, optional fix block)
+
+    tc = by_label.get("toolchain")
+    if tc and tc.status == "info":
+        # No image built yet — the store-touching reads were skipped, so the "not
+        # checked" facts up top are not a clean bill of health. Surface the one setup
+        # step; its presence also stops the verdict from claiming "Everything healthy".
+        items.append((["The agent image isn't built yet.", "Run `agent build` to set it up."], ""))
+
+    nofile = by_label.get("open files")
+    if nofile and nofile.status == "fail":
+        body = [f"The open-file limit is too low: {nofile.value} (want ≥524288)."]
+        body += list(nofile.why)
+        if nofile.fix:
+            body.append(f"Fix — {nofile.fix}.")
+        items.append((body, nofile.fix_block))
+
+    if tc and tc.status == "warn":
+        items.append((["A newer toolchain is available.", "Run `agent update`."], ""))
+
+    for c in containers:
+        if c.fresh is False:
+            who = _abbrev_path(c.path) if c.path else c.name
+            items.append(([f"{who} is out of date.", "It is recreated on its next `agent run`."], ""))
+
+    if LEGACY_BUILD_CACHE_VOLUME in volumes:
+        size = _fmt_size(vol_sizes.get(LEGACY_BUILD_CACHE_VOLUME), round_int=True)
+        amount = f"{size} of " if size else ""
+        items.append(([f"{amount}old build cache can be freed.", "Run `agent clean`."], ""))
+
+    print()
+    if not items:
+        print(f"  {green('✓')}  {green('Everything healthy')}")
+        return
+    print(f"  {yellow('!')} {bold('Needs attention')}")
+    for body, block in items:
+        print()
+        print(f"    {dim('•')} {body[0]}")
+        for line in body[1:]:
+            print(f"        {dim(line)}")
+        if block:
+            _doctor_block(block)
 
 
 def _doctor_json(
@@ -1746,6 +1926,11 @@ def _shared_root(
         engine,
         "run",
         "--rm",
+        # The agent image is always already built by the time we run root work
+        # against the shared store, so never reach a registry. Guards the doctor's
+        # drift eval offline; the network `agent update` needs is inside the
+        # container (nix fetching), which `--pull` doesn't touch.
+        "--pull=never",
         "--user",
         "0:0",
         "-v",
