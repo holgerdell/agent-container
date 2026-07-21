@@ -189,6 +189,16 @@ def red(s: str) -> str:
     return _c(s, "31")
 
 
+def _progress(msg: str, *, file: TextIO = sys.stdout) -> None:
+    """Print one 'this is starting' line and flush it immediately. Without the
+    explicit flush, a line printed right before a slow subprocess call can sit in
+    Python's block buffer — invisible — until the buffer fills or the program
+    exits, which defeats the point of printing it early whenever stdout/stderr
+    isn't a TTY (piped through `tee`, redirected to a log, etc)."""
+    print(msg, file=file)
+    file.flush()
+
+
 _KEY_UP = "up"
 _KEY_DOWN = "down"
 _KEY_SPACE = "space"
@@ -837,6 +847,11 @@ def run_doctor(engine: str, image: str, settings: Settings, *, as_json: bool = F
     img_ok = image_exists(engine, image)
     have_volume = img_ok and _volume_exists(engine, volume)
 
+    # stderr, not stdout: `--json` needs stdout to stay clean JSON, and this line
+    # is transient status, not part of the report — the report itself is the
+    # completion signal, so there's no matching "done" line.
+    _progress(f"{_sty('1;34', '→', err=True)} Checking environment...", file=sys.stderr)
+
     # Raw reads submitted so ty infers each `Future[…]` cleanly; `_safe_result`
     # extracts them after join.
     with concurrent.futures.ThreadPoolExecutor() as ex:
@@ -1449,14 +1464,22 @@ def resolve_repo_root(pwd: Path, home: Path) -> Path:
 _DOCKER_INSTALL_HINT = "https://docs.docker.com/get-docker/"
 
 
-def check_engine(engine: str) -> None:
+def check_engine(engine: str, *, quiet: bool = False) -> None:
+    """`quiet` suppresses the progress pair: `agent doctor --json` needs stdout to
+    stay clean JSON, and this runs before doctor's own as_json branch even exists."""
     if not shutil.which(engine):
         die(f"{engine} not in PATH\nInstall: {_DOCKER_INSTALL_HINT}")
 
+    # Runs on every invocation and is usually instant, but `engine info` can take
+    # several seconds if the daemon is still cold-starting — print before, not after.
+    if not quiet:
+        _progress(f"{_sty('1;34', '→')} Checking {engine}...")
     info = _run_quiet([engine, "info"])
     if info.returncode != 0:
         stderr = info.stderr.decode(errors="replace").strip()
         die(f"`{engine} info` failed:\n{stderr}")
+    if not quiet:
+        _progress(f"{_sty('1;32', '✓')} {engine} ready.")
 
 
 def image_exists(engine: str, image: str) -> bool:
@@ -1536,6 +1559,7 @@ def _inspect_run_container(engine: str, name: str) -> tuple[bool, str] | None:
 def create_run_container(engine: str, spec: RunSpec) -> None:
     """Create the detached, idle persistent container. On a create race
     (another session claimed the name first), fall through if it now exists."""
+    _progress(f"{_sty('1;34', '→')} Starting session container...")
     mount_flags = [arg for m in spec.mounts for arg in ("-v", m)]
     env_flags = [arg for e in spec.env for arg in ("-e", e)]
     cmd = [
@@ -1561,39 +1585,48 @@ def create_run_container(engine: str, spec: RunSpec) -> None:
     r = _run_quiet(cmd)
     if r.returncode != 0 and _inspect_run_container(engine, spec.name) is None:
         die(f"failed to create container {spec.name}:\n{r.stderr.decode(errors='replace').strip() or f'exit {r.returncode}'}")
+    _progress(f"{_sty('1;32', '✓')} Session container ready.")
 
 
-def ensure_run_container(engine: str, spec: RunSpec) -> str:
+def ensure_run_container(engine: str, image: str, spec: RunSpec) -> str:
     """Create-or-reuse: one inspect drives absent/stale/stopped/running. Returns
     the transition so the caller can (re)write the per-session gcroot only when
     the container freshly starts on the current generation — `"fresh"` for a
     newly created or restarted container, `"reused"` when joining one that was
     already running (its gcroot already records its start generation)."""
     state = _inspect_run_container(engine, spec.name)
+    if state is not None and state[0]:
+        if state[1] == spec.fingerprint:
+            # running + matching → nothing to do. The store doesn't need
+            # re-checking: this same container proved it seeded when it started,
+            # and nothing about a shared, already-mounted volume can go stale
+            # while it's in use.
+            return "reused"
+        # Stale config (e.g. after `agent update`), but a session is still
+        # running in it — recreating would kill that session. Join the old
+        # container instead; it picks up the new config once stopped.
+        warn(
+            f"{spec.name} config changed but a session is still running; "
+            f"joining the existing (outdated) container instead of rebuilding. "
+            f"Run `agent stop` once no session is active to pick up the new config."
+        )
+        return "reused"
+
+    # Every path below freshly (re)starts the container against the shared store,
+    # so this is the only place that needs to pay for confirming it's seeded.
+    ensure_seeded(engine, image)
     if state is None:
         create_run_container(engine, spec)
-        return "fresh"
-    if state[1] != spec.fingerprint:
-        if state[0]:
-            # Stale config (e.g. after `agent update`), but a session is still
-            # running in it — recreating would kill that session. Join the old
-            # container instead; it picks up the new config once stopped.
-            warn(
-                f"{spec.name} config changed but a session is still running; "
-                f"joining the existing (outdated) container instead of rebuilding. "
-                f"Run `agent stop` once no session is active to pick up the new config."
-            )
-            return "reused"
+    elif state[1] != spec.fingerprint:
         # Stopped and stale → safe to tear down and recreate.
         _run_quiet([engine, "rm", "-f", spec.name])
         create_run_container(engine, spec)
-        return "fresh"
-    if not state[0]:
+    else:
         # Stopped but matching → fast restart (the point of persistence).
+        _progress(f"{_sty('1;34', '→')} Restarting session container...")
         _run_quiet([engine, "start", spec.name])
-        return "fresh"
-    # running + matching → nothing to do.
-    return "reused"
+        _progress(f"{_sty('1;32', '✓')} Session container ready.")
+    return "fresh"
 
 
 def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path) -> RunSpec:
@@ -1706,7 +1739,7 @@ def _run_quiet(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
 
 
 def _clean_step(label: str, cmd: list[str], *, missing_ok: bool = False) -> None:
-    print(f"{_sty('1;34', '→')} {label}...")
+    _progress(f"{_sty('1;34', '→')} {label}...")
     r = _run_quiet(cmd)
     stderr = r.stderr.decode(errors="replace").strip()
     if r.returncode == 0:
@@ -1819,7 +1852,7 @@ def _gc_shared_store(engine: str, image: str, volume: str, running: set[str]) ->
         steps.append(f"nix-env --profile {DEFAULT_PROFILE} --delete-generations " + " ".join(str(g_) for g_ in del_gens))
     # Always collect: reclaims trimmed generations *and* update's build-time deps.
     steps.append("nix-collect-garbage >&2")
-    print(
+    _progress(
         f"{_sty('1;34', '→')} Collecting shared store (keeping gen {current}"
         + (f" + live {sorted(set(live_gens))}" if live_gens else "")
         + ")..."
@@ -1832,7 +1865,7 @@ def _gc_shared_store(engine: str, image: str, volume: str, running: set[str]) ->
 def _reclaim_images(engine: str) -> None:
     """Remove not-in-use agent image tags and orphaned build-cache tarballs."""
     in_use_ids = _images_in_use(engine)
-    print(f"{_sty('1;34', '→')} Inspecting agent images...")
+    _progress(f"{_sty('1;34', '→')} Inspecting agent images...")
     r = subprocess.run(
         [engine, "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}", "agent"],
         capture_output=True,
@@ -1984,15 +2017,21 @@ def ensure_seeded(engine: str, image: str) -> str:
     if missing. Shared by `run` and `update`, so seeding lives in one place and
     neither command has an ordering precondition. Returns the volume name."""
     volume = nix_shared_volume(getpass.getuser())
-    if _volume_exists(engine, volume) and _shared_volume_seeded(engine, volume):
-        return volume
+    if _volume_exists(engine, volume):
+        # The common warm-start case: the store already exists, but confirming
+        # it's *seeded* still spins up a throwaway container (see
+        # `_shared_volume_seeded`) — silent otherwise, on every single invocation.
+        _progress(f"{_sty('1;34', '→')} Checking shared store...")
+        if _shared_volume_seeded(engine, volume):
+            _progress(f"{_sty('1;32', '✓')} Shared store ready.")
+            return volume
     if not image_exists(engine, image):
         build(engine, image)
     _run_quiet([engine, "volume", "create", volume])
     with _seed_lock(volume):
         if _shared_volume_seeded(engine, volume):
             return volume  # lost the first-run race; the winner seeded it
-        print(f"{_sty('1;34', '→')} Seeding shared /nix store {volume} from image (one-time)...")
+        _progress(f"{_sty('1;34', '→')} Seeding shared /nix store {volume} from image (one-time)...")
         # Docker copies the image's baked /nix into the empty volume on mount.
         r = _run_quiet([engine, "run", "--rm", "-v", f"{volume}:/nix", image, "true"])
         if r.returncode != 0:
@@ -2039,7 +2078,7 @@ def build(engine: str, image: str) -> None:
     uid, gid = os.getuid(), os.getgid()
     build_name = build_container_name(uid, gid)
     if _is_container_running(engine, build_name):
-        print(f"{_sty('1;34', '→')} Another build is already running ({build_name}); waiting for it to finish...")
+        _progress(f"{_sty('1;34', '→')} Another build is already running ({build_name}); waiting for it to finish...")
         r = subprocess.run([engine, "wait", build_name], capture_output=True, text=True, check=False)
         if r.returncode != 0:
             die(f"failed to wait for concurrent build {build_name}:\n{r.stderr.strip() or f'exit {r.returncode}'}")
@@ -2065,7 +2104,7 @@ def build(engine: str, image: str) -> None:
     # AGENT_UID/AGENT_GID feed the impure `.#image` (baked agent user, home chown).
     gcroot = f"/nix/var/nix/gcroots/agent-image-u{uid}g{gid}"
     print(f"{_sty('1;35', '⬢')} {_bold('build → image')} {dim('(seed for new sessions)')}")
-    print(f"  {_sty('1;34', '→')} Building image {image}  {dim('(nix .#image)')}")
+    _progress(f"  {_sty('1;34', '→')} Building image {image}  {dim('(nix .#image)')}")
     build_proc = subprocess.Popen(
         [
             engine,
@@ -2091,7 +2130,7 @@ def build(engine: str, image: str) -> None:
         stdout=subprocess.PIPE,
     )
     assert build_proc.stdout is not None
-    print(f"  {_sty('1;34', '→')} Loading into {engine}  {dim('(tarball → engine)')}")
+    _progress(f"  {_sty('1;34', '→')} Loading into {engine}  {dim('(tarball → engine)')}")
     load = subprocess.run(
         [engine, "load"],
         stdin=build_proc.stdout,
@@ -2131,7 +2170,7 @@ def run_update(engine: str, image: str) -> None:
     volume = ensure_seeded(engine, image)
 
     _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
-    print(f"  {_sty('1;34', '→')} Updating flake.lock  {dim('(agent-image/)')}")
+    _progress(f"  {_sty('1;34', '→')} Updating flake.lock  {dim('(agent-image/)')}")
     subprocess.run(
         [
             engine,
@@ -2167,7 +2206,7 @@ def run_update(engine: str, image: str) -> None:
     # atomically repoint the default profile — the new generation is rooted just
     # by being the profile. Build only swaps when the toolchain path actually
     # changed, so a no-op update never piles up redundant generations.
-    print(f"  {_sty('1;34', '→')} Building toolchain  {dim(f'(nix .#toolchain → {volume})')}")
+    _progress(f"  {_sty('1;34', '→')} Building toolchain  {dim(f'(nix .#toolchain → {volume})')}")
     build_and_swap = (
         "set -e\n"
         "tc=$(nix build path:/build#toolchain --no-link --print-out-paths)\n"
@@ -2250,10 +2289,11 @@ def main() -> None:
     # Image is UID-keyed because the agent user inside it is baked at build time.
     image = os.environ.get("AGENT_IMAGE", f"agent:u{os.getuid()}g{os.getgid()}")
 
-    check_engine(engine)
+    as_json = cmd == "doctor" and "--json" in extra
+    check_engine(engine, quiet=as_json)
 
     if cmd == "doctor":
-        run_doctor(engine, image, settings, as_json="--json" in extra)
+        run_doctor(engine, image, settings, as_json=as_json)
         return
 
     if cmd == "clean":
@@ -2273,6 +2313,7 @@ def main() -> None:
         return
 
     if cmd == "check":
+        _progress(f"{_sty('1;34', '→')} Checking flake...")
         subprocess.run(
             [
                 engine,
@@ -2306,10 +2347,12 @@ def main() -> None:
 
     uid, gid = os.getuid(), os.getgid()
     # The shared /nix store is mounted read-write at /nix (folded into the run
-    # spec's mounts). Seed it from the image's baked /nix on first ever use,
-    # serialized by a first-run flock; every later container just mounts the
-    # populated volume. `agent update` upgrades this store in place — no rebuild.
-    volume = ensure_seeded(engine, image)
+    # spec's mounts), seeded from the image's baked /nix on first ever use. The
+    # name is deterministic (no docker call needed to know it); `ensure_run_container`
+    # is the one that pays for actually confirming/seeding it, and only when a
+    # container is about to freshly mount it. `agent update` upgrades this store
+    # in place — no rebuild.
+    volume = nix_shared_volume(getpass.getuser())
     # The home volume is still separate: Docker seeds it from image content
     # on first creation. Home on a named volume (not a bind mount) keeps all
     # of ~/.elan, ~/.cache, ~/.local etc on native container fs, avoiding
@@ -2320,7 +2363,7 @@ def main() -> None:
     old_home = xdg_data / "agent-container" / "home"
     volume_missing = _run_quiet([engine, "volume", "inspect", home_volume]).returncode != 0
     if old_home.is_dir() and volume_missing:
-        print(f"{_sty('1;34', '→')} Migrating old home directory into {home_volume}...")
+        _progress(f"{_sty('1;34', '→')} Migrating old home directory into {home_volume}...")
         _run_quiet([engine, "volume", "create", home_volume])
         r = subprocess.run(
             [
@@ -2348,7 +2391,7 @@ def main() -> None:
 
     # Create-or-reuse the per-repo persistent container, then exec into it.
     spec = build_run_spec(engine, settings, image, mount_root)
-    state = ensure_run_container(engine, spec)
+    state = ensure_run_container(engine, image, spec)
     # When the container freshly (re)starts, its new processes resolve the
     # current generation — record it as a host-written gcroot so a concurrent
     # `agent update`/`agent clean` in another repo can't collect the toolchain
@@ -2364,8 +2407,14 @@ def main() -> None:
     exec_cmd += ["-w", str(cwd), spec.name]
     if cmd == "shell":
         exec_cmd += ["bash", *extra]
+        _progress(f"{_sty('1;34', '→')} Starting shell...")
     else:
         exec_cmd += ["claude", "--dangerously-skip-permissions", *extra]
+        # `execvp` replaces this process, so nothing printed after this point is
+        # ever seen — the gap between here and claude's own UI appearing (its
+        # startup: auth check, update check, etc) is outside this script's
+        # control, but at least the wait is now announced instead of silent.
+        _progress(f"{_sty('1;34', '→')} Starting claude...")
 
     os.execvp(engine, exec_cmd)
 
