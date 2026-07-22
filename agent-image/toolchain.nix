@@ -112,6 +112,7 @@ let
         nodejs
         opencode
         openssh
+        pandoc
         poppler-utils
         procps
         psutils
