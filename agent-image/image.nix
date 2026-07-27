@@ -129,6 +129,10 @@ pkgs.dockerTools.buildLayeredImage {
       "NIX_LD=/nix/var/nix/profiles/default/lib/${loaderBasename}"
       "NIX_LD_LIBRARY_PATH=/nix/var/nix/profiles/default/lib"
       "LD_LIBRARY_PATH=/nix/var/nix/profiles/default/lib"
+      # Profile-stable locale archive: glibc reads generated locales (e.g.
+      # en_US.UTF-8, which mistral-vibe's bash tool sets on every subprocess)
+      # from here, avoiding `setlocale` warnings polluting tool stderr.
+      "LOCALE_ARCHIVE=/nix/var/nix/profiles/default/lib/locale/locale-archive"
     ];
   };
 }

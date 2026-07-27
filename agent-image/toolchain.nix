@@ -50,7 +50,9 @@ let
   # ones exposed.
   nixLdLib = pkgs.runCommand "agent-nix-ld-lib" { } ''
     mkdir -p $out/lib
-    for d in ${lib.concatMapStringsSep " " (p: "${lib.getLib p}/lib") (nixLdLibraries ++ [ pkgs.glibc ])}; do
+    for d in ${
+      lib.concatMapStringsSep " " (p: "${lib.getLib p}/lib") (nixLdLibraries ++ [ pkgs.glibc ])
+    }; do
       [ -d "$d" ] || continue
       for f in "$d"/*; do
         name=$(basename "$f")
@@ -73,8 +75,9 @@ let
 
   toolchain = pkgs.buildEnv {
     name = "agent-toolchain";
-    paths =
-      (with pkgs; [
+    paths = (
+      with pkgs;
+      [
         bashInteractive
         bun
         bzip2
@@ -93,6 +96,11 @@ let
         gcc
         gh
         git
+        # glibcLocales provides the generated locale archive (en_US.UTF-8 and
+        # friends) read via LOCALE_ARCHIVE in the image env. Without it, every
+        # subprocess that sets LC_ALL=en_US.UTF-8 (e.g. mistral-vibe's bash tool)
+        # prints a `setlocale` warning to stderr on every invocation.
+        glibcLocales
         gnupg
         gnugrep
         gnused
@@ -162,7 +170,8 @@ let
         #     (see above), keeping glibc and the nix-ld set in the rooted closure.
         nix-ld
         nixLdLib
-      ]);
+      ]
+    );
     ignoreCollisions = true;
     pathsToLink = [
       "/bin"
