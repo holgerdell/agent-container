@@ -125,14 +125,77 @@ class SharedMount:
 
 
 @dataclass(frozen=True)
+class CodingAgent:
+    """A selectable coding agent `agent` can launch by default. `id` is both the
+    settings key and the binary name; `args` are the fixed launch flags
+    (approvals policy) appended before any user-supplied `--` extras."""
+
+    id: str
+    label: str
+    args: tuple[str, ...] = ()
+    description: str = ""
+
+
+# The coding agents baked into the toolchain that `agent` can launch. Each
+# `args` is that agent's approvals flag — the container itself is the sandbox,
+# so approvals are skipped on launch. claude and codex also bypass their own
+# sandbox (claude `--dangerously-skip-permissions`, codex
+# `--dangerously-bypass-approvals-and-sandbox`); opencode `--auto` and vibe
+# `--auto-approve` auto-approve tool calls in-session. `ollama` is a model
+# server, not an interactive coding agent, so it's absent here.
+AGENTS: tuple[CodingAgent, ...] = (
+    CodingAgent(
+        "claude",
+        "Claude Code",
+        ("--dangerously-skip-permissions",),
+        "Anthropic's official CLI coding agent.",
+    ),
+    CodingAgent(
+        "codex",
+        "Codex",
+        ("--dangerously-bypass-approvals-and-sandbox",),
+        "OpenAI's CLI coding agent. Sandbox and approvals are bypassed since the container is the sandbox.",
+    ),
+    CodingAgent(
+        "opencode",
+        "OpenCode",
+        ("--auto",),
+        "Open-source coding agent. Permissions are auto-approved since the container is the sandbox.",
+    ),
+    CodingAgent(
+        "vibe",
+        "Mistral Vibe",
+        ("--auto-approve",),
+        "Mistral's CLI coding agent. Tool calls are auto-approved since the container is the sandbox.",
+    ),
+)
+DEFAULT_AGENT_ID = "claude"
+
+
+def _is_known_agent(agent_id: object) -> bool:
+    return isinstance(agent_id, str) and any(a.id == agent_id for a in AGENTS)
+
+
+def _agent_by_id(agent_id: str) -> CodingAgent:
+    for a in AGENTS:
+        if a.id == agent_id:
+            return a
+    # A stale settings file from a removed agent: fall back to the default
+    # rather than die, mirroring mount_mode's lenient handling.
+    return next(a for a in AGENTS if a.id == DEFAULT_AGENT_ID)
+
+
+@dataclass(frozen=True)
 class Settings:
     mount_mode: str = "repo_root"
+    coding_agent: str = DEFAULT_AGENT_ID
     shared_host_paths: list[SharedMount] = field(default_factory=list)
     env_vars: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "mount_mode": self.mount_mode,
+            "coding_agent": self.coding_agent,
             "shared_host_paths": [m.to_json() for m in self.shared_host_paths],
             "env_vars": list(self.env_vars),
         }
@@ -424,8 +487,8 @@ HELP_TEXT = f"""\
 {_bold("Usage:")} agent [OPTIONS] [SUBCOMMAND] [-- EXTRA_ARGS...]
 
 Launch a Nix-built agent workspace in the current directory.
-With no subcommand, runs claude. Extra args after `--` are forwarded
-to claude (or to bash with `shell`).
+With no subcommand, runs the default coding agent (claude). Extra args
+after `--` are forwarded to that agent (or to bash with `shell`).
 
 {_bold("Options:")}
   {_bold("--help")}                  Show this help message and exit
@@ -434,7 +497,7 @@ to claude (or to bash with `shell`).
 
 {_bold("Subcommands:")}
   {_bold("setup")}    Configure agent (interactive)
-  {_bold("shell")}    Open a bash shell instead of running claude
+  {_bold("shell")}    Open a bash shell instead of the coding agent
   {_bold("build")}    Build the seed image (via Nix) and exit — rare; routine
            toolchain bumps go through {_bold("update")}
   {_bold("update")}   Upgrade the toolchain in place: bump flake.lock, build, and
@@ -520,7 +583,7 @@ def load_settings() -> Settings:
         die(f"malformed settings file {path}: {e}\nRun `agent setup` to recreate it.")
     if not isinstance(loaded, dict):
         die(f"malformed settings file {path}: expected JSON object\nRun `agent setup` to recreate it.")
-    known = {"mount_mode", "shared_host_paths", "env_vars"}
+    known = {"mount_mode", "shared_host_paths", "env_vars", "coding_agent"}
     for key in loaded:
         if key in known or key == "container_engine":  # container_engine: obsolete, docker-only now
             continue
@@ -529,8 +592,13 @@ def load_settings() -> Settings:
     if mount_mode not in {"pwd", "repo_root"}:
         warn(f"unknown mount_mode {mount_mode!r} in {path}; using 'repo_root'")
         mount_mode = "repo_root"
+    coding_agent = loaded.get("coding_agent", DEFAULT_AGENT_ID)
+    if not _is_known_agent(coding_agent):
+        warn(f"unknown coding_agent {coding_agent!r} in {path}; using {DEFAULT_AGENT_ID!r}")
+        coding_agent = DEFAULT_AGENT_ID
     return Settings(
         mount_mode=mount_mode,
+        coding_agent=coding_agent,
         shared_host_paths=_parse_shared_mounts(loaded.get("shared_host_paths", []), path),
         env_vars=_parse_env_vars(loaded.get("env_vars", []), path),
     )
@@ -583,6 +651,19 @@ def _ask_questions(current: Settings) -> Settings | None:
     if mount_mode is None:
         return None
 
+    agent_choices: list[tuple[str, str, str]] = []
+    for a in AGENTS:
+        label = f"{a.label} {default_marker}" if a.id == DEFAULT_AGENT_ID else a.label
+        agent_choices.append((label, a.id, a.description))
+    coding_agent = tui_select(
+        "Which coding agent should `agent` launch by default?",
+        agent_choices,
+        initial=current.coding_agent,
+        summary_message="Default coding agent",
+    )
+    if coding_agent is None:
+        return None
+
     selected_builtin_hosts = {m.host for m in current.shared_host_paths if m.builtin}
     builtin_choices: list[tuple[str, SharedMount, bool]] = [
         (f"{host}  {desc}", SharedMount(host, container, builtin=True), host in selected_builtin_hosts)
@@ -609,7 +690,7 @@ def _ask_questions(current: Settings) -> Settings | None:
             return None
         shared_host_paths = shared
 
-    return replace(current, mount_mode=mount_mode, shared_host_paths=shared_host_paths)
+    return replace(current, mount_mode=mount_mode, coding_agent=coding_agent, shared_host_paths=shared_host_paths)
 
 
 def run_setup() -> None:
@@ -2409,12 +2490,13 @@ def main() -> None:
         exec_cmd += ["bash", *extra]
         _progress(f"{_sty('1;34', '→')} Starting shell...")
     else:
-        exec_cmd += ["claude", "--dangerously-skip-permissions", *extra]
+        agent = _agent_by_id(settings.coding_agent)
+        exec_cmd += [agent.id, *agent.args, *extra]
         # `execvp` replaces this process, so nothing printed after this point is
-        # ever seen — the gap between here and claude's own UI appearing (its
+        # ever seen — the gap between here and the agent's own UI appearing (its
         # startup: auth check, update check, etc) is outside this script's
         # control, but at least the wait is now announced instead of silent.
-        _progress(f"{_sty('1;34', '→')} Starting claude...")
+        _progress(f"{_sty('1;34', '→')} Starting {agent.label}...")
 
     os.execvp(engine, exec_cmd)
 

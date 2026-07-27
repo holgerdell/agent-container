@@ -127,7 +127,7 @@ class SetupTUITests(unittest.TestCase):
 
     def test_vim_keys_navigate_select(self) -> None:
         code, _ = _drive(
-            [b"j", KEY_ENTER, KEY_ENTER],
+            [b"j", KEY_ENTER, KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
@@ -135,11 +135,12 @@ class SetupTUITests(unittest.TestCase):
 
     def test_default_mount_when_no_navigation(self) -> None:
         code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER],
+            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
         self.assertEqual(self._saved()["mount_mode"], "repo_root")
+        self.assertEqual(self._saved()["coding_agent"], "claude")
 
     def test_existing_settings_are_prefilled(self) -> None:
         # Pre-existing pwd overrides the repo_root default.
@@ -153,7 +154,7 @@ class SetupTUITests(unittest.TestCase):
             ),
         )
         code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER],
+            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
             home=self.home,
         )
         self.assertEqual(code, 0)
@@ -173,7 +174,7 @@ class SetupTUITests(unittest.TestCase):
                 }
             )
         )
-        code, _ = _drive([KEY_ENTER, KEY_ENTER], home=self.home)
+        code, _ = _drive([KEY_ENTER, KEY_ENTER, KEY_ENTER], home=self.home)
         self.assertEqual(code, 0)
         self.assertEqual(
             self._saved()["shared_host_paths"],
@@ -182,12 +183,44 @@ class SetupTUITests(unittest.TestCase):
 
     def test_narrow_terminal_does_not_crash(self) -> None:
         code, _ = _drive(
-            [KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
+            [KEY_ENTER, KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
             home=self.home,
             cols=40,
         )
         self.assertEqual(code, 0)
         self.assertEqual(len(self._saved()["shared_host_paths"]), 2)
+
+    def test_coding_agent_selects_non_default(self) -> None:
+        # Mount default (Enter), then move down to Codex and select it (j, Enter),
+        # then submit the shared-host-paths checkbox (Enter).
+        code, _ = _drive(
+            [KEY_ENTER, b"j", KEY_ENTER, KEY_ENTER],
+            home=self.home,
+        )
+        self.assertEqual(code, 0)
+        saved = self._saved()
+        self.assertEqual(saved["mount_mode"], "repo_root")
+        self.assertEqual(saved["coding_agent"], "codex")
+
+    def test_existing_agent_is_prefilled(self) -> None:
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"coding_agent": "opencode"}))
+        code, _ = _drive(
+            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
+            home=self.home,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self._saved()["coding_agent"], "opencode")
+
+    def test_unknown_agent_falls_back_to_default(self) -> None:
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"coding_agent": "gone-agent"}))
+        code, _ = _drive(
+            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
+            home=self.home,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self._saved()["coding_agent"], "claude")
 
     def test_ctrl_c_cancels_cleanly(self) -> None:
         code, _ = _drive([KEY_CTRLC], home=self.home)
