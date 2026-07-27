@@ -1302,9 +1302,7 @@ def _doctor_header(checks: list[DoctorCheck]) -> None:
     print("  " + dim("Using " + "  ·  ".join(parts)))
 
 
-def _render_tree(
-    containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None, ages: dict[str, int]
-) -> None:
+def _render_tree(containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None, ages: dict[str, int]) -> None:
     """Group containers under the image they were built from — the derivation at a
     glance. Containers on a rebuilt image show as an untagged id. The current image
     is always listed (even with no containers) so a fully-drifted set is visible."""
@@ -1375,9 +1373,7 @@ def _volume_order(volumes: list[str]) -> list[str]:
 _MATRIX_COLS = ("update", "build", "clean")
 
 
-def _doctor_matrix(
-    containers: list[RunContainer], tag_map: dict[str, str], volumes: list[str], current_short: str | None
-) -> None:
+def _doctor_matrix(containers: list[RunContainer], tag_map: dict[str, str], volumes: list[str], current_short: str | None) -> None:
     """What each maintenance command would do to every artifact, one row each. Computed
     from the *current* state, never a guess: `agent clean` leaves images pinned by a
     live (running) session, so an image's clean effect is read off what is running —
@@ -1424,9 +1420,7 @@ def _doctor_matrix(
         print(("    " + label.ljust(label_w) + "  " + cells).rstrip())
 
 
-def _doctor_advisory(
-    checks: list[DoctorCheck], containers: list[RunContainer], volumes: list[str], vol_sizes: dict[str, str]
-) -> None:
+def _doctor_advisory(checks: list[DoctorCheck], containers: list[RunContainer], volumes: list[str], vol_sizes: dict[str, str]) -> None:
     """The single bottom section — shown only when something needs attention, each item
     in plain language with its fix. It never gates the exit code (the checks upstream
     do); it only re-presents their advisory/fail signals plus the actionable inventory,
