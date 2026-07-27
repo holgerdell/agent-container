@@ -51,7 +51,7 @@ class TestToolchainDrift:
     check as an advisory `warn` — never a `fail` that would trip `agent doctor &&`."""
 
     def _probe(self, **kw):
-        base = dict(claude="9", opencode="1", nofile="1048576", generation=3, lock_date="2026-07-19")
+        base = {"claude": "9", "opencode": "1", "nofile": "1048576", "generation": 3, "lock_date": "2026-07-19"}
         base.update(kw)
         return agent.Probe(**base)
 
