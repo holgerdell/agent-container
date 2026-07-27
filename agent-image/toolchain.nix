@@ -81,6 +81,7 @@ let
         cacert
         clang
         claude-code-pkg
+        codex
         coreutils
         curl
         delta
@@ -104,12 +105,14 @@ let
         katex
         less
         man-db
+        mistral-vibe
         mypy
         nano
         nauty
         neovim
         nix
         nodejs
+        ollama
         opencode
         openssh
         pandoc
