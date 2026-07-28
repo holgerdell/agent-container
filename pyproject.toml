@@ -9,6 +9,12 @@ dev = ["pytest", "mypy", "ruff", "ty"]
 [tool.uv]
 package = false
 
+[tool.pytest.ini_options]
+# Collect only `tests/`. Without this, a git worktree checked out *inside* this
+# repo gets walked too, and pytest finds two copies of every test module under
+# the same import name.
+testpaths = ["tests"]
+
 [tool.ruff]
 extend-include = ["agent"]
 target-version = "py312"

@@ -1,248 +1,329 @@
-"""Black-box tests for `agent setup` interactive prompts.
+"""Tests for `agent setup`.
 
-Spawns the script under a controlled pty, drives keystrokes, and verifies
-the settings file produced. POSIX-only (depends on pty + termios).
+The terminal UI itself is expected to keep changing, so it is only smoke-tested
+end to end: a real pty run proves that setup starts, reacts to keystrokes, and
+writes (or refuses to write) the settings file.
+
+Everything setup actually *decides* — which choices are offered, and how the
+answers fold back into settings — is exercised directly against
+`_ask_questions`, with the three prompt widgets replaced by stubs that answer
+the way a user would. No terminal involved, so no timing to get wrong.
 """
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import json
 import os
 import pty
-import select
-import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import termios
+import threading
 import time
-import unittest
-from collections.abc import Iterable
-from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-AGENT = REPO_ROOT / "agent"
+import pytest
 
-KEY_DOWN = b"\x1b[B"
-KEY_UP = b"\x1b[A"
+from tests.agent_module import AGENT_SCRIPT, agent
+from tests.harness import Env
+
+# --- stubbed prompts ---------------------------------------------------------
+
+
+class FakeUI:
+    """Stands in for the three prompt widgets `_ask_questions` drives.
+
+    Every prompt is answered exactly as presented — a bare Enter everywhere —
+    unless the test says otherwise: `pick` chooses a value in a radio prompt,
+    and `turn_on`/`turn_off` flip named checkbox entries the way pressing space
+    does. `cancel_at` aborts the nth prompt, like Ctrl-C. Prompts are recorded
+    so tests can assert on what was offered."""
+
+    def __init__(self, *, pick=(), turn_on=(), turn_off=(), cancel_at: int | None = None) -> None:
+        self.pick = list(pick)
+        self.turn_on = list(turn_on)
+        self.turn_off = list(turn_off)
+        self.cancel_at = cancel_at
+        self.prompts: list[dict[str, Any]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> FakeUI:
+        monkeypatch.setattr(agent, "tui_select", self._select)
+        monkeypatch.setattr(agent, "tui_tristate", self._tristate)
+        monkeypatch.setattr(agent, "tui_checkbox", self._checkbox)
+        return self
+
+    def _cancelled(self, kind: str, choices: list, details: str | None = None) -> bool:
+        self.prompts.append({"kind": kind, "values": [c[1] for c in choices], "details": details})
+        return len(self.prompts) - 1 == self.cancel_at
+
+    def _state(self, value: Any, state: str) -> str:
+        if any(value == v for v in self.turn_on):
+            return agent.GROUP_SELECTED
+        if any(value == v for v in self.turn_off):
+            return agent.GROUP_UNSELECTED
+        return state
+
+    def _select(self, message, choices, *, initial=None, summary_message=None):
+        if self._cancelled("select", choices):
+            return None
+        values = [value for _, value, _ in choices]
+        for wanted in self.pick:
+            if wanted in values:
+                return wanted
+        return initial if initial in values else values[0]
+
+    def _tristate(self, message, choices, *, summary_message=None, details=None):
+        if self._cancelled("tristate", choices, details):
+            return None
+        return [(value, self._state(value, state)) for _, value, state in choices]
+
+    def _checkbox(self, message, choices, *, summary_message=None, details=None):
+        if self._cancelled("checkbox", choices, details):
+            return None
+        states = [(value, self._state(value, agent.GROUP_SELECTED if on else agent.GROUP_UNSELECTED)) for _, value, on in choices]
+        return [value for value, state in states if state == agent.GROUP_SELECTED]
+
+
+@pytest.fixture
+def ask(monkeypatch, tmp_path):
+    """Answer setup's questions and return (resulting settings, FakeUI)."""
+    # A HOME with none of the allowlisted host paths present, so the read-only
+    # mount prompt offers exactly what the settings under test ask for.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    def _ask(current: agent.Settings | None = None, **kwargs) -> tuple[agent.Settings | None, FakeUI]:
+        ui = FakeUI(**kwargs).install(monkeypatch)
+        return agent._ask_questions(current if current is not None else agent.Settings()), ui
+
+    return _ask
+
+
+LATEX = "latex"
+
+
+class TestDefaults:
+    def test_fresh_settings_keep_the_catalog_defaults(self, ask):
+        result, _ = ask()
+        assert result is not None
+        assert result.mount_mode == "repo_root"
+        assert result.coding_agent == agent.DEFAULT_AGENT_ID
+        for pkg in ("git", "texlive-xetex", "python3", "ripgrep"):
+            assert pkg in result.apt_packages
+        for extra in ("uv", "claude-code", "typst", "ollama"):
+            assert extra in result.extra_packages
+
+    def test_existing_answers_are_prefilled(self, ask):
+        current = agent.Settings(mount_mode="pwd", coding_agent="opencode")
+        result, _ = ask(current)
+        assert result is not None
+        assert result.mount_mode == "pwd"
+        assert result.coding_agent == "opencode"
+
+    def test_an_agent_that_no_longer_exists_falls_back_to_the_default(self, ask):
+        result, _ = ask(agent.Settings(coding_agent="gone-agent"))
+        assert result is not None
+        assert result.coding_agent == agent.DEFAULT_AGENT_ID
+
+    def test_cancelling_any_prompt_discards_everything(self, ask):
+        for n in range(4):
+            result, ui = ask(cancel_at=n)
+            assert result is None, f"prompt {n} was cancelled but setup still returned settings"
+            assert len(ui.prompts) == n + 1
+
+
+class TestAptGroups:
+    def test_clearing_a_group_removes_every_member(self, ask):
+        result, _ = ask(turn_off=[LATEX])
+        assert result is not None
+        assert "texlive-xetex" not in result.apt_packages
+        assert "biber" not in result.apt_packages
+        assert "git" in result.apt_packages
+
+    def test_selecting_a_partial_group_expands_it(self, ask):
+        result, _ = ask(agent.Settings(apt_packages=["biber"]), turn_on=[LATEX])
+        assert result is not None
+        assert {"biber", "texlive-xetex"} <= set(result.apt_packages)
+
+    def test_an_untouched_partial_group_keeps_its_packages(self, ask):
+        result, _ = ask(agent.Settings(apt_packages=["biber"]))
+        assert result is not None
+        assert result.apt_packages == ["biber"]
+
+    def test_custom_package_names_survive_and_are_explained(self, ask):
+        result, ui = ask(agent.Settings(apt_packages=["git", "my-internal-tool"]))
+        assert result is not None
+        assert "my-internal-tool" in result.apt_packages
+        # Custom names are never offered as a togglable group, only mentioned.
+        groups = next(p for p in ui.prompts if p["kind"] == "tristate")
+        assert "my-internal-tool" not in groups["values"]
+        assert "my-internal-tool" in (groups["details"] or "")
+
+
+class TestExtras:
+    def test_only_registry_entries_are_offered(self, ask):
+        result, _ = ask(agent.Settings(extra_packages=["uv", "not-a-real-package"]))
+        assert result is not None
+        assert result.extra_packages == ["uv"]
+
+    def test_an_extra_can_be_switched_on(self, ask):
+        result, _ = ask(agent.Settings(extra_packages=[]), turn_on=["uv"])
+        assert result is not None
+        assert result.extra_packages == ["uv"]
+
+    def test_choosing_a_coding_agent_does_not_install_it(self, ask):
+        result, _ = ask(agent.Settings(coding_agent="claude-code", extra_packages=[]), pick=["codex"])
+        assert result is not None
+        assert result.coding_agent == "codex"
+        assert result.extra_packages == []
+
+
+class TestSharedMounts:
+    def test_a_configured_builtin_mount_is_kept(self, ask):
+        host, container, _ = agent.SHARED_HOST_PATHS_ALLOWLIST[0]
+        mount = agent.SharedMount(host, container, builtin=True)
+        result, _ = ask(agent.Settings(shared_host_paths=[mount]))
+        assert result is not None
+        assert result.shared_host_paths == [mount]
+
+    def test_a_custom_mount_is_kept(self, ask):
+        mount = agent.SharedMount("/etc/example.conf", "/home/agent/example.conf", builtin=False)
+        result, _ = ask(agent.Settings(shared_host_paths=[mount]))
+        assert result is not None
+        assert result.shared_host_paths == [mount]
+
+    def test_nothing_is_offered_when_nothing_applies(self, ask):
+        result, ui = ask()
+        assert result is not None
+        assert result.shared_host_paths == []
+        assert len(ui.prompts) == 4
+
+
+# --- end-to-end through a real terminal --------------------------------------
+
 KEY_ENTER = b"\r"
-KEY_SPACE = b" "
+KEY_DOWN = b"j"
 KEY_CTRLC = b"\x03"
 
+SETTLE = 0.25  # output quiet for this long means the program is waiting on us
+MAX_PROMPTS = 20  # cap on "press Enter until it exits", so a hang still fails
+TIMEOUT = 120.0
 
-def _drive(
-    keys: Iterable[bytes],
-    *,
-    home: Path,
-    cols: int = 80,
-    rows: int = 24,
-    timeout: float = 10.0,
-) -> tuple[int, bytes]:
-    """Run `agent setup` in a pty, send keys, return (exit_code, output)."""
+
+def drive_setup(env: Env, keys: Sequence[bytes] = (), *, accept_rest: bool = True) -> tuple[int, str]:
+    """Run `agent setup` under a pty, send `keys`, then (unless told not to)
+    keep pressing Enter until it exits. Returns (exit code, everything printed).
+
+    A key is sent only once the previous one has visibly landed — the prompt it
+    produced is fully drawn and setup is back to waiting for input. Typing ahead
+    is not an option: setup leaves raw mode between prompts, and the terminal
+    drops whatever is queued when the mode changes."""
     pid, fd = pty.fork()
-    if pid == 0:
-        env = os.environ.copy()
-        env["HOME"] = str(home)
-        env["XDG_CONFIG_HOME"] = str(home / ".config")
-        env["XDG_DATA_HOME"] = str(home / ".local/share")
-        env["NO_COLOR"] = "1"
+    if pid == 0:  # pragma: no cover - child process
         try:
-            os.execvpe(str(AGENT), [str(AGENT), "setup"], env)
-        except OSError as e:
-            sys.stderr.write(f"exec failed: {e}\n")
+            os.execve(sys.executable, [sys.executable, str(AGENT_SCRIPT), "setup"], env.env())
+        finally:
             os._exit(127)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
 
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     captured = bytearray()
+    lock = threading.Lock()
+    last = [time.monotonic()]
 
-    def drain(idle: float, total: float) -> None:
-        end = time.time() + total
-        last = time.time()
-        while time.time() < end and time.time() - last < idle:
-            r, _, _ = select.select([fd], [], [], 0.05)
-            if not r:
-                continue
+    def pump() -> None:
+        while True:
             try:
                 chunk = os.read(fd, 4096)
-            except OSError:
+            except OSError:  # master side EOF: the child is gone
                 return
             if not chunk:
                 return
-            captured.extend(chunk)
-            last = time.time()
-
-    drain(idle=0.3, total=3.0)
-    for key in keys:
-        os.write(fd, key)
-        drain(idle=0.3, total=3.0)
-
-    deadline = time.time() + timeout
-    raw_status = 0
-    exited = False
-    while time.time() < deadline:
-        wpid, st = os.waitpid(pid, os.WNOHANG)
-        if wpid != 0:
-            raw_status = st
-            exited = True
-            break
-        r, _, _ = select.select([fd], [], [], 0.1)
-        if r:
-            try:
-                chunk = os.read(fd, 4096)
-            except OSError:
-                break
-            if chunk:
+            with lock:
                 captured.extend(chunk)
+                last[0] = time.monotonic()
 
-    if not exited:
-        os.kill(pid, 9)
-        os.waitpid(pid, 0)
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + TIMEOUT
+
+    def wait_for_prompt(seen: int) -> bool:
+        """Wait until setup has printed past `seen` bytes and fallen silent, i.e.
+        it is sitting at a prompt. False once it has exited (or timed out)."""
+        while reader.is_alive() and time.monotonic() < deadline:
+            with lock:
+                grown, quiet = len(captured) > seen, time.monotonic() - last[0]
+            if grown and quiet >= SETTLE:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def finish(message: str | None) -> tuple[int, str]:
+        reader.join(max(0.0, deadline - time.monotonic()))
+        alive = reader.is_alive()
+        if alive:
+            os.kill(pid, 9)
+        _, status = os.waitpid(pid, 0)
         os.close(fd)
-        raise TimeoutError(f"agent setup did not exit within {timeout}s")
+        text = bytes(captured).decode(errors="replace")
+        if alive or message:
+            raise AssertionError(f"{message or 'agent setup did not exit'}\n--- output ---\n{text}")
+        return os.waitstatus_to_exitcode(status), text
 
-    with contextlib.suppress(OSError):
-        os.close(fd)
-    return os.waitstatus_to_exitcode(raw_status), bytes(captured)
+    if not wait_for_prompt(0):
+        return finish("agent setup never reached its first prompt")
+    for key in list(keys) + ([KEY_ENTER] * MAX_PROMPTS if accept_rest else []):
+        with lock:
+            seen = len(captured)
+        try:
+            os.write(fd, key)
+        except OSError:  # it exited while we were reaching for the keyboard
+            break
+        if not wait_for_prompt(seen):
+            break
+    return finish(None)
 
 
-class SetupTUITests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="agent-setup-test-"))
-        self.home = self.tmp / "home"
-        (self.home / ".claude").mkdir(parents=True)
-        (self.home / ".claude" / "CLAUDE.md").write_text("test\n")
-        (self.home / ".claude" / "skills").mkdir()
-        self.settings = self.home / ".config" / "agent-container" / "settings.json"
+@pytest.fixture
+def setup_env(tmp_path) -> Env:
+    env = Env(tmp_path)
+    claude = env.home / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    (claude / "CLAUDE.md").write_text("test\n")
+    return env
 
-    def tearDown(self) -> None:
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _saved(self) -> dict[str, Any]:
-        data: dict[str, Any] = json.loads(self.settings.read_text())
-        return data
+class TestEndToEnd:
+    def test_accepting_every_prompt_saves_settings(self, setup_env: Env) -> None:
+        code, out = drive_setup(setup_env)
+        assert code == 0, out
+        saved = json.loads(setup_env.settings_path.read_text())
+        assert saved["mount_mode"] == "repo_root"
+        assert saved["coding_agent"] == agent.DEFAULT_AGENT_ID
+        assert saved["apt_packages"]
+        # Configuration changes must never kick off a build or an install.
+        assert not setup_env.log_path.exists()
 
-    def test_vim_keys_navigate_select(self) -> None:
-        code, _ = _drive(
-            [b"j", KEY_ENTER, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(self._saved()["mount_mode"], "pwd")
+    def test_keystrokes_change_the_answer(self, setup_env: Env) -> None:
+        code, out = drive_setup(setup_env, [KEY_DOWN])
+        assert code == 0, out
+        saved = json.loads(setup_env.settings_path.read_text())
+        assert saved["mount_mode"] == "pwd"
 
-    def test_default_mount_when_no_navigation(self) -> None:
-        code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(self._saved()["mount_mode"], "repo_root")
-        self.assertEqual(self._saved()["coding_agent"], "claude")
+    def test_ctrl_c_cancels_without_saving(self, setup_env: Env) -> None:
+        code, out = drive_setup(setup_env, [KEY_CTRLC], accept_rest=False)
+        assert code != 0, out
+        assert not setup_env.settings_path.exists()
 
-    def test_existing_settings_are_prefilled(self) -> None:
-        # Pre-existing pwd overrides the repo_root default.
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text(
-            json.dumps(
-                {
-                    "mount_mode": "pwd",
-                    "shared_host_paths": ["~/.claude/skills/"],
-                },
-            ),
-        )
-        code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        saved = self._saved()
-        self.assertEqual(saved["mount_mode"], "pwd")
-        self.assertEqual(saved["shared_host_paths"], ["~/.claude/skills/"])
-
-    def test_existing_custom_shared_mount_is_preserved(self) -> None:
-        custom_host = self.home / "custom-config"
-        custom_host.write_text("token=1\n")
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text(
-            json.dumps(
-                {
-                    "mount_mode": "repo_root",
-                    "shared_host_paths": [{"host": str(custom_host), "container": "/home/agent/custom-config"}],
-                }
-            )
-        )
-        code, _ = _drive([KEY_ENTER, KEY_ENTER, KEY_ENTER], home=self.home)
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            self._saved()["shared_host_paths"],
-            [{"host": str(custom_host), "container": "/home/agent/custom-config"}],
-        )
-
-    def test_narrow_terminal_does_not_crash(self) -> None:
-        code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_UP, KEY_SPACE, KEY_UP, KEY_SPACE, KEY_DOWN, KEY_DOWN, KEY_ENTER],
-            home=self.home,
-            cols=40,
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(len(self._saved()["shared_host_paths"]), 2)
-
-    def test_coding_agent_selects_non_default(self) -> None:
-        # Mount default (Enter), then move down to Codex and select it (j, Enter),
-        # then submit the shared-host-paths checkbox (Enter).
-        code, _ = _drive(
-            [KEY_ENTER, b"j", KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        saved = self._saved()
-        self.assertEqual(saved["mount_mode"], "repo_root")
-        self.assertEqual(saved["coding_agent"], "codex")
-
-    def test_existing_agent_is_prefilled(self) -> None:
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text(json.dumps({"coding_agent": "opencode"}))
-        code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(self._saved()["coding_agent"], "opencode")
-
-    def test_unknown_agent_falls_back_to_default(self) -> None:
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text(json.dumps({"coding_agent": "gone-agent"}))
-        code, _ = _drive(
-            [KEY_ENTER, KEY_ENTER, KEY_ENTER],
-            home=self.home,
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(self._saved()["coding_agent"], "claude")
-
-    def test_ctrl_c_cancels_cleanly(self) -> None:
-        code, _ = _drive([KEY_CTRLC], home=self.home)
-        self.assertNotEqual(code, 0)
-        self.assertFalse(self.settings.exists())
-
-    def test_non_tty_stdin_errors_cleanly(self) -> None:
-        env = os.environ.copy()
-        env["HOME"] = str(self.home)
-        env["XDG_CONFIG_HOME"] = str(self.home / ".config")
-        env["XDG_DATA_HOME"] = str(self.home / ".local/share")
+    def test_non_tty_stdin_errors_cleanly(self, setup_env: Env) -> None:
         proc = subprocess.run(
-            [str(AGENT), "setup"],
+            [sys.executable, str(AGENT_SCRIPT), "setup"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            env=env,
+            env=setup_env.env(),
             check=False,
-            timeout=10,
+            timeout=60,
         )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn(b"TTY", proc.stderr)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert proc.returncode != 0
+        assert b"TTY" in proc.stderr

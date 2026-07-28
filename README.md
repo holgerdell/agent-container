@@ -12,7 +12,7 @@ Yet another script for running a coding agent in an isolated container. Here's w
 - 📁 Only the current workspace is mounted into the container
 - 🔒 Selected config files (`~/.gitconfig`, etc.) can optionally be mounted read-only
 - 🗂️ The container's home directory is persisted across runs in an isolated, per-user named volume
-- ❄️ The container uses Nix instead of a Dockerfile, which makes it easy to customize to your needs
+- 📦 The image is plain Debian Sid plus the APT packages you pick, so it is easy to understand and change
 
 ## Requirements
 
@@ -28,38 +28,75 @@ git clone https://github.com/holgerdell/agent-container
 ln -s "agent-container/agent" ~/.local/bin/agent
 ```
 
-Then run `agent setup` to configure workspace options. The image is built automatically on first run — no host Nix required.
+Then run `agent setup` to configure workspace options and pick your packages. The image is built automatically on first run.
 
 ## Usage
 
 ```sh
-agent              # run claude in the current directory
+agent              # run your default coding agent in the current directory
 agent shell        # open bash instead
-agent setup        # configure workspace sharing, read-only host mounts
+agent setup        # configure workspace, packages, agent, read-only host mounts
+agent build        # rebuild the Debian image, then reconcile extra tools
+agent update       # install/update/remove extra tools in the home volume
 agent stop         # remove this repo's persistent container (--all for every repo)
-agent build        # build the seed image and exit (rare; bumps go through update)
-agent update       # upgrade the toolchain in place: bump flake.lock, build, swap
-agent check        # validate Nix expression without building
-agent doctor       # run environment health checks
-agent clean        # session-respecting reclaim (--force also kills live sessions)
-agent reset        # delete the shared /nix volume and reseed from the image
+agent doctor       # report local environment state
+agent clean        # remove stopped containers and unused agent images
 agent help         # show help
 ```
 
-Extra arguments after `--` are forwarded to `claude` (or `bash` with `shell`):
+Extra arguments after `--` are forwarded to the coding agent (or `bash` with `shell`):
 
 ```sh
 agent -- --print "hello"
 agent shell -- -c 'echo hi'
 ```
 
-`agent setup` configures the workspace root (current directory or git repo root) and read-only host mounts (`~/.gitconfig`, `~/.claude/CLAUDE.md`, etc.). Settings are stored at `~/.config/agent-container/settings.json`; re-run any time to change them. For custom mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths` in that file.
+## Two kinds of packages
 
-The agent's home directory is persisted across runs in a named volume. The Nix store is a **persistent, writeable, per-user volume** shared across all your repos, seeded once from the image's baked `/nix` on first run. `agent update` upgrades the toolchain *in place* — it builds the new toolchain straight into the shared store and atomically swaps the Nix profile, so a new shell picks it up with no image rebuild and no container restart. `agent clean` reclaims old toolchain generations while protecting any that a live session is still using; `agent reset` deletes the shared volume and reseeds from scratch.
+The environment is split into an image half and a home-volume half, and each is changed by its own command.
 
-## File descriptor limits
+| | **Debian packages** | **Extra tools** |
+| --- | --- | --- |
+| Where they live | the image, `agent:<username>` | the home volume, `agent-home-<username>` |
+| Installed by | `apt-get` during `agent build` | each tool's own upstream installer |
+| Changed by | `agent build` | `agent update` (and `agent build`) |
+| Configured as | `apt_packages` in settings | `extra_packages` in settings |
 
-Some setups cap open file descriptors at 1024 (a systemd default, kept for `select(2)` safety). Heavy parallel builds — e.g. `lake build` for Lean projects — can blow past it, surfacing as transient `Too many open files` warnings. Run `agent doctor` to check and get a copy-pasteable fix.
+`agent build` always pulls a fresh `debian:sid-slim`. When Debian has republished that base image, or your package selection changed, the packages are reinstalled from the current archive; otherwise cached layers are reused and an unchanged rebuild finishes in seconds. `agent build --refresh` skips the cache entirely and reinstalls everything, whatever the base image says. `agent update` never touches APT — system upgrades happen only through `agent build`.
+
+`agent doctor` reports the image's age from when it was actually created, so a cached rebuild does not reset it.
+
+Running sessions survive both commands. A stopped container whose image or configuration has changed is recreated the next time you launch that repository.
+
+### Debian packages
+
+`agent setup` presents them as logical groups (LaTeX, development tools, Python, editors, …) and toggles whole groups at a time. Settings store the resulting flat list of package names, so you can also hand-edit `apt_packages` to select individual packages or add names outside the built-in catalog — setup preserves them, and shows a partly-selected group as `[~]`.
+
+Package names are not validated up front: an unknown or renamed package fails the `apt-get install` step, which is the authoritative answer.
+
+If the image was built from a different selection than your settings currently describe, `agent` warns on launch and keeps going. Run `agent build` when you want to apply it.
+
+### Extra tools
+
+These come from a small curated registry baked into the script — `uv`, `bun`, `ruff`, `ty`, `typos`, `typst`, `claude-code`, `codex`, `mistral-vibe`, `opencode`, and `ollama`. Each entry defines its own install, update, and removal routine using the tool's official upstream mechanism, plus the exact paths under `/home/agent` it owns.
+
+They are installed into the persistent home volume, which is shared by every repository, so you install and update them once per user. Deselecting a tool removes only the files that tool's registry entry declares; anything you installed yourself is never touched.
+
+`agent update` runs every selected tool even if an earlier one fails, prints a per-package summary, and exits nonzero if anything failed. After each install or update it checks that the tool's executable actually resolves on `PATH`, so an installer that exits 0 without producing a working binary is reported as a failure rather than recorded as installed. Failed operations stay pending, so re-running converges.
+
+The installers themselves need a few ordinary Debian packages — `curl`, `ca-certificates`, and the archivers (`xz-utils`, `zstd`, `tar`) — plus `npm` for `codex`. All of these are in the default selection; if you trim the package groups right down, the affected installer fails with the tool's own error and you can add the package back and rerun.
+
+The coding agents among these (`claude-code`, `codex`, `mistral-vibe`, `opencode`) also carry launch metadata; those are the choices offered for the default agent. Your default-agent choice is independent of package selection — if you pick one whose package isn't installed, the launch simply fails.
+
+## The persistent home volume
+
+`agent-home-<username>` is mounted at `/home/agent` in every session container and every updater container, and it is writable by the interactive agent user. It holds your native tool installations, tool state, caches, credentials, and home-directory configuration.
+
+No `agent` command ever removes, migrates, or reclaims it — `agent clean` only removes stopped containers and unused `agent:*` images. If you genuinely want to delete it, use Docker directly:
+
+```sh
+docker volume rm agent-home-$(whoami)
+```
 
 ## SSH agent forwarding
 
@@ -87,6 +124,10 @@ git -C /path/to/repo fetch
 When you run `agent`, the container automatically bind-mounts `~/.cache/git/credential/` so the in-container git connects to the host-side cache daemon over the socket. The container image is pre-configured with `credential.helper = cache`.
 
 To refresh credentials after a reboot, run a `git fetch` (or any authenticated operation) on the host once before starting the agent.
+
+## Settings
+
+Settings live at `~/.config/agent-container/settings.json`; re-run `agent setup` any time to change them. For custom read-only mounts beyond the built-in shortcuts, add objects of the form `{"host": "~/path", "container": "/path"}` to `shared_host_paths`.
 
 ## Environment variables
 

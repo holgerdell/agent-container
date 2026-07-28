@@ -22,35 +22,31 @@ from pathlib import Path
 from typing import Any, NoReturn, TextIO
 
 ENGINE = "docker"
-NIX_IMAGE = "docker.io/nixos/nix:latest"
-NIX_BUILD_CACHE_VOLUME = "agent-buildcache"
-# Its former name — kept only so `agent clean` can reap the leftover after a
-# rename (it borrowed the `agent-nix-` store prefix and read like the real store).
-LEGACY_BUILD_CACHE_VOLUME = "agent-nix-store"
-# The shared, persistent, writeable /nix volume — one per user (from `whoami`),
-# shared across all of that user's repos and stable across image rebuilds. It is
-# root-owned; the toolchain lives here as the default nix profile and is upgraded
-# in place by `agent update`. Distinct from NIX_BUILD_CACHE_VOLUME.
-NIX_SHARED_VOLUME_PREFIX = "agent-nix-"
-# Path of the root-owned system default profile inside the shared volume.
-PROFILES_DIR = "/nix/var/nix/profiles"
-DEFAULT_PROFILE = f"{PROFILES_DIR}/default"
-# Per-session gcroots the host writes so GC can't collect a generation a sibling
-# container is still using (each container has its own PID namespace, so Nix's
-# runtime-root scan can't see across them).
-SESSION_GCROOT_DIR = "/nix/var/nix/gcroots"
-SESSION_GCROOT_PREFIX = "session-"
-# Nix config for the transient *root* container that writes the shared store.
-# `build-users-group =` (empty) forces single-user builds as root — the agent
-# image has no `nixbld` build-user group, and root is the sole writer anyway.
-NIX_ROOT_CONFIG = "experimental-features = nix-command flakes\nbuild-users-group ="
+BASE_IMAGE = "debian:sid-slim"
+IMAGE_PREFIX = "agent:"
+# The shared, persistent home volume — one per user (from `whoami`), mounted at
+# /home/agent in every session container and every transient updater container.
+# It holds native-installed tools, tool state, caches, credentials, and normal
+# home-directory content, and is never removed by any `agent` command.
 HOME_VOLUME_PREFIX = "agent-home-"
 RUN_CONTAINER_PREFIX = "agent-run-"
+CONTAINER_HOME = "/home/agent"
+# Where native upstream installers put their binaries. These must be on PATH for
+# interactive shells, coding-agent launches, and updater containers alike, so this
+# one list feeds both the image's `ENV PATH` and the generated login-shell profile
+# snippet — adding an extra's bin directory is a single edit here.
+HOME_BIN_DIRS = (".local/bin", ".bun/bin", ".cargo/bin", ".opencode/bin", ".elan/bin")
+# Where reconciliation records what Agent manages, inside the shared home volume.
+EXTRAS_STATE_PATH = f"{CONTAINER_HOME}/.local/state/agent-container/extras.json"
+EXTRAS_STATE_SCHEMA = 1
+# Image metadata baked by the Dockerfile; also mirrored into an image label.
+APT_FINGERPRINT_LABEL = "agent.apt.fingerprint"
 # `agent doctor` shows the persistent-container count as informational; it only
 # warns (hinting `stop --all` / `clean`) once the pile crosses this. Kept high
 # enough that a multi-repo developer's normal one-per-repo containers don't nag.
 RUN_PILEUP_WARN = 5
 SCRIPT_DIR = Path(__file__).resolve().parent
+IMAGE_DIR = SCRIPT_DIR / "agent-image"
 
 SHARED_HOST_PATHS_ALLOWLIST: list[tuple[str, str, str]] = [
     ("~/.claude/CLAUDE.md", "/home/agent/.claude/CLAUDE.md", "global Claude instructions"),
@@ -67,44 +63,711 @@ def _allowlist_containers() -> dict[str, str]:
     return {host: container for host, container, _ in SHARED_HOST_PATHS_ALLOWLIST}
 
 
-# --- Shared /nix store lifecycle: pure logic (integration-verified callers) ---
+# --- APT package catalog: pure logic -----------------------------------------
 
 
-def nix_shared_volume(username: str) -> str:
-    """The per-user shared /nix volume name, keyed by `whoami`."""
-    return f"{NIX_SHARED_VOLUME_PREFIX}{username}"
+@dataclass(frozen=True)
+class AptGroup:
+    """One logical bundle of Debian package names. Every catalog package belongs
+    to exactly one group, so a group's state is derivable from the flat settings
+    list and toggling a group is a pure set operation."""
+
+    id: str
+    label: str
+    description: str
+    packages: tuple[str, ...]
 
 
-def parse_generation(profile_link_target: str) -> int | None:
-    """Parse N from a `default-N-link` profile-generation target (a bare link
-    name or a full path). None if it isn't a generation link."""
-    m = re.match(r"(?:.*/)?default-(\d+)-link$", profile_link_target.strip())
-    return int(m.group(1)) if m else None
+# The built-in APT catalog. Order here is the order `agent setup` shows, and the
+# union of all groups is the default selection for a fresh settings file.
+APT_GROUPS: tuple[AptGroup, ...] = (
+    AptGroup(
+        "core",
+        "Core utilities",
+        "Archivers, process tools, and other everyday shell basics.",
+        (
+            "bzip2",
+            "file",
+            "procps",
+            "tzdata",
+            "unzip",
+            "which",
+            "xz-utils",
+            "zip",
+            "zstd",
+        ),
+    ),
+    AptGroup(
+        "vcs",
+        "Source control & networking",
+        "git and friends, GitHub CLI, SSH client, curl, and trust anchors.",
+        (
+            "ca-certificates",
+            "curl",
+            "gh",
+            "git",
+            "git-delta",
+            "gnupg",
+            "openssh-client",
+        ),
+    ),
+    AptGroup(
+        "shell",
+        "Shell tooling",
+        "Search, formatting, linting, and JSON/text processing for scripts.",
+        (
+            "gawk",
+            "jq",
+            "just",
+            "ripgrep",
+            "shellcheck",
+            "shfmt",
+        ),
+    ),
+    AptGroup(
+        "editors",
+        "Editors & terminal",
+        "Terminal editors, multiplexer, prompt, pager, and process viewer.",
+        (
+            "fzf",
+            "htop",
+            "less",
+            "man-db",
+            "nano",
+            "neovim",
+            "starship",
+            "tmux",
+        ),
+    ),
+    AptGroup(
+        "build",
+        "Development & build tools",
+        "C/C++ toolchain, make, benchmarking, and the Lean toolchain manager.",
+        (
+            "build-essential",
+            "clang",
+            "elan",
+            "hyperfine",
+            "make",
+            "nauty",
+            "patch",
+            "pkg-config",
+            "time",
+        ),
+    ),
+    AptGroup(
+        "python",
+        "Python",
+        "System Python with a type checker and syntax highlighting.",
+        (
+            "python3",
+            "python3-mypy",
+            "python3-pygments",
+        ),
+    ),
+    AptGroup(
+        "node",
+        "Node.js",
+        "Node runtime and npm — needed by npm-distributed coding agents.",
+        (
+            "nodejs",
+            "npm",
+        ),
+    ),
+    AptGroup(
+        "docs",
+        "Documents & media",
+        "Document conversion and PDF manipulation.",
+        (
+            "pandoc",
+            "poppler-utils",
+        ),
+    ),
+    AptGroup(
+        "latex",
+        "LaTeX",
+        "A full TeX Live install with fonts, bibliography tooling, and a language server.",
+        (
+            "biber",
+            "ghostscript",
+            "latexmk",
+            "lmodern",
+            "psutils",
+            "texlab",
+            "texlive-base",
+            "texlive-bibtex-extra",
+            "texlive-binaries",
+            "texlive-extra-utils",
+            "texlive-fonts-extra",
+            "texlive-fonts-recommended",
+            "texlive-lang-english",
+            "texlive-latex-base",
+            "texlive-latex-extra",
+            "texlive-latex-recommended",
+            "texlive-luatex",
+            "texlive-pictures",
+            "texlive-pstricks",
+            "texlive-publishers",
+            "texlive-science",
+            "texlive-xetex",
+        ),
+    ),
+)
+
+GROUP_SELECTED = "on"
+GROUP_UNSELECTED = "off"
+GROUP_PARTIAL = "partial"
 
 
-def generations_to_delete(all_gens: list[int], current: int, live_gens: list[int]) -> list[int]:
-    """Gentle-GC retention: keep the current generation and every generation
-    with number >= the oldest live session's recorded generation; delete the
-    rest. With no live session, keep only the current generation. (A long job
-    can span two upgrades and run on a generation that is neither its session's
-    start-generation nor the current one, so we keep the whole tail from the
-    oldest-live floor up.)"""
-    floor = min(live_gens) if live_gens else current
-    return sorted(g for g in all_gens if g < floor and g != current)
+def catalog_packages(groups: tuple[AptGroup, ...] = APT_GROUPS) -> set[str]:
+    """Every package name the built-in catalog knows about."""
+    return {p for g in groups for p in g.packages}
 
 
-def session_roots_to_reap(root_names: list[str], running: set[str]) -> list[str]:
-    """Session gcroots whose container is not currently running. Keying on
-    *not-running* (rather than *absent*) unifies clean-stop, crash-exit, and
-    removal — a stopped container has no live processes to protect, and a crash
-    can't leak a permanent root."""
-    reap: list[str] = []
-    for r in root_names:
-        if not r.startswith(SESSION_GCROOT_PREFIX):
+def default_apt_packages(groups: tuple[AptGroup, ...] = APT_GROUPS) -> list[str]:
+    """The initial APT selection: everything in the catalog."""
+    return normalize_apt_packages(catalog_packages(groups))
+
+
+def normalize_apt_packages(names: object) -> list[str]:
+    """Canonical form of an APT selection: trimmed, de-duplicated, sorted. Both
+    the fingerprint and the generated package list are built from this, so two
+    settings files that select the same set always produce the same image."""
+    if not isinstance(names, list | tuple | set | frozenset):
+        return []
+    cleaned = {n.strip() for n in names if isinstance(n, str) and n.strip()}
+    return sorted(cleaned)
+
+
+def apt_fingerprint(names: object) -> str:
+    """Deterministic fingerprint of a normalized APT selection. Baked into the
+    image at build time and re-derived from settings at launch, so drift between
+    "what the image contains" and "what settings ask for" is observable."""
+    payload = "\n".join(normalize_apt_packages(names))
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def group_state(group: AptGroup, selected: object) -> str:
+    """Whether every, some, or no package of `group` is in the selection."""
+    chosen = set(normalize_apt_packages(selected))
+    present = [p for p in group.packages if p in chosen]
+    if not present:
+        return GROUP_UNSELECTED
+    if len(present) == len(group.packages):
+        return GROUP_SELECTED
+    return GROUP_PARTIAL
+
+
+def apply_group_states(
+    selected: object,
+    states: list[tuple[str, str]],
+    groups: tuple[AptGroup, ...] = APT_GROUPS,
+) -> list[str]:
+    """Fold group toggles back into a flat package list. A group left `partial`
+    keeps exactly the packages settings already selected (hand-edited selections
+    survive an untouched setup run); `on` adds every member, `off` drops them all.
+    Custom names outside the catalog are always preserved."""
+    by_id = {g.id: g for g in groups}
+    result = set(normalize_apt_packages(selected))
+    for group_id, state in states:
+        group = by_id.get(group_id)
+        if group is None:
             continue
-        if r[len(SESSION_GCROOT_PREFIX) :] not in running:
-            reap.append(r)
-    return reap
+        if state == GROUP_SELECTED:
+            result |= set(group.packages)
+        elif state == GROUP_UNSELECTED:
+            result -= set(group.packages)
+    return normalize_apt_packages(result)
+
+
+def custom_apt_packages(selected: object, groups: tuple[AptGroup, ...] = APT_GROUPS) -> list[str]:
+    """Selected names the built-in catalog doesn't know. Setup preserves these
+    untouched and never shows them in the group picker."""
+    known = catalog_packages(groups)
+    return [p for p in normalize_apt_packages(selected) if p not in known]
+
+
+# --- Native extra-package registry -------------------------------------------
+
+
+@dataclass(frozen=True)
+class AgentLaunch:
+    """Coding-agent launch metadata for an extra package. `executable` is the
+    binary `agent` execs; `args` are the fixed launch flags (approvals policy)
+    appended before any user-supplied `--` extras."""
+
+    executable: str
+    label: str
+    args: tuple[str, ...] = ()
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class ExtraPackage:
+    """A curated native tool installed into the shared home volume through its
+    own upstream mechanism. Install/update/remove routines are fixed here — never
+    taken from settings — so the trust boundary stays in version control.
+
+    `owned_paths` are the *specific* files and directories under /home/agent that
+    Agent's managed installation creates. Removal touches nothing else, so a
+    user's own tools and state can never be collected."""
+
+    id: str
+    label: str
+    description: str
+    install: str
+    update: str
+    owned_paths: tuple[str, ...]
+    executables: tuple[str, ...]
+    uninstall: str = ""
+    agent: AgentLaunch | None = None
+
+
+# Extract a GitHub release tag without depending on jq (which is an optional
+# APT group). Used by entries whose release assets embed the version.
+_LATEST_TAG = 'sed -n \'s/.*"tag_name": *"\\([^"]*\\)".*/\\1/p\' | head -1'
+_EXTRAS_DIR = "$HOME/.local/share/agent-extras"
+
+
+def _astral_install(tool: str) -> str:
+    """The Astral installers append PATH lines to six shell rc files and drop an
+    `env` script unless their install dir is already on PATH. It always is here,
+    so they stay quiet — but the image owns PATH, so say so outright rather than
+    depend on that coincidence surviving a change to HOME_BIN_DIRS."""
+    return f"curl -LsSf https://astral.sh/{tool}/install.sh | INSTALLER_NO_MODIFY_PATH=1 sh"
+
+
+def _skip_if_latest(exe: str, repo: str) -> str:
+    """Guard for installers that always download a whole release: leave early when
+    the installed tool already reports the latest published tag. Anything
+    uncertain — no tool, no tag, an unparsable version — falls through and
+    reinstalls, so the guard can only ever save work, never skip a real update."""
+    return (
+        f"if command -v {exe} >/dev/null 2>&1; then\n"
+        f"  latest=$(curl -fsSL https://api.github.com/repos/{repo}/releases/latest | {_LATEST_TAG})\n"
+        f'  have=$({exe} --version 2>&1 | grep -oE "[0-9]+\\.[0-9]+[0-9A-Za-z.+-]*" | head -1)\n'
+        '  if [ -n "$latest" ] && [ -n "$have" ] && [ "${latest#v}" = "$have" ]; then exit 0; fi\n'
+        "fi\n"
+    )
+
+
+# The two tarball entries below install a prebuilt upstream release into an
+# Agent-owned directory and expose one symlink on PATH. Everything they write
+# lives under paths the registry entry declares, so removal is exact. Neither
+# tool can update itself, so the whole release is re-downloaded on every update
+# run — hence the version guard in front of each.
+
+_TYPST_INSTALL = (
+    _skip_if_latest("typst", "typst/typst") + "set -e\n"
+    'mkdir -p "$HOME/.local/bin"\n'
+    f'rm -rf "{_EXTRAS_DIR}/typst"\n'
+    f'mkdir -p "{_EXTRAS_DIR}/typst"\n'
+    'curl -fsSL "https://github.com/typst/typst/releases/latest/download/typst-$(uname -m)-unknown-linux-musl.tar.xz"'
+    f' | tar -xJ -C "{_EXTRAS_DIR}/typst" --strip-components=1\n'
+    f'ln -sfn "{_EXTRAS_DIR}/typst/typst" "$HOME/.local/bin/typst"\n'
+)
+
+_OLLAMA_INSTALL = (
+    # Ollama's tarball is ~1.5 GB, so skipping a redundant download saves minutes.
+    _skip_if_latest("ollama", "ollama/ollama") + "set -e\n"
+    'mkdir -p "$HOME/.local/bin"\n'
+    'case "$(uname -m)" in aarch64|arm64) arch=arm64 ;; *) arch=amd64 ;; esac\n'
+    f'rm -rf "{_EXTRAS_DIR}/ollama"\n'
+    f'mkdir -p "{_EXTRAS_DIR}/ollama"\n'
+    'curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-$arch.tar.zst"'
+    f' | tar --zstd -x -C "{_EXTRAS_DIR}/ollama"\n'
+    f'ln -sfn "{_EXTRAS_DIR}/ollama/bin/ollama" "$HOME/.local/bin/ollama"\n'
+)
+
+# The curated registry. Order is significant and stable: reconciliation always
+# walks it front to back, so `uv` is installed before the tools that use it.
+#
+# `owned_paths` lists only what a package installs for itself, never a file it
+# shares with another entry. The Astral installers, left to themselves, would
+# write `~/.local/bin/env` and `~/.local/bin/env.fish` from uv, ruff, and ty
+# alike — unassignable to any one package, and unsafe to claim for one because
+# removing it would break the others. `INSTALLER_NO_MODIFY_PATH=1` stops them
+# being created at all, since the image already owns PATH.
+EXTRA_REGISTRY: tuple[ExtraPackage, ...] = (
+    ExtraPackage(
+        id="uv",
+        label="uv",
+        description="Astral's Python package and project manager.",
+        install=_astral_install("uv"),
+        # `self update` is the one uv subcommand that cares which uv runs it: it
+        # refuses outright unless the binary matches the install receipt, so a
+        # second uv earlier on PATH would fail the update instead of no-opping.
+        # The other entries' `uv tool` commands are indifferent — they write to
+        # the same XDG directories whichever uv serves them — so only this one
+        # names an absolute path.
+        update='"$HOME/.local/bin/uv" self update',
+        owned_paths=(".local/bin/uv", ".local/bin/uvx"),
+        executables=("uv",),
+    ),
+    ExtraPackage(
+        id="bun",
+        label="Bun",
+        description="Fast JavaScript runtime, bundler, and package manager.",
+        # `bun completions`, which both the installer and every `bun upgrade` run,
+        # picks its target from $SHELL and can append to a shell rc file or write
+        # into XDG completion dirs — outside the paths this entry owns. An
+        # unrecognized shell makes it print instructions instead of writing.
+        # BUN_INSTALL is explicit so the `bunx` symlink cannot fall back to
+        # ~/.local/bin, which belongs to other entries.
+        install='curl -fsSL https://bun.com/install | BUN_INSTALL="$HOME/.bun" SHELL=/bin/sh bash',
+        update='BUN_INSTALL="$HOME/.bun" SHELL=/bin/sh bun upgrade',
+        owned_paths=(".bun",),
+        executables=("bun",),
+    ),
+    ExtraPackage(
+        id="ruff",
+        label="Ruff",
+        description="Astral's Python linter and formatter.",
+        install=_astral_install("ruff"),
+        update=_astral_install("ruff"),
+        owned_paths=(".local/bin/ruff",),
+        executables=("ruff",),
+    ),
+    ExtraPackage(
+        id="ty",
+        label="ty",
+        description="Astral's Python type checker.",
+        install=_astral_install("ty"),
+        update=_astral_install("ty"),
+        owned_paths=(".local/bin/ty",),
+        executables=("ty",),
+    ),
+    ExtraPackage(
+        id="typos",
+        label="typos",
+        description="Source-code spell checker (installed as a uv tool).",
+        install="uv tool install typos",
+        update="uv tool upgrade typos",
+        uninstall="uv tool uninstall typos",
+        owned_paths=(".local/bin/typos", ".local/share/uv/tools/typos"),
+        executables=("typos",),
+    ),
+    ExtraPackage(
+        id="typst",
+        label="Typst",
+        description="Modern markup-based typesetting system.",
+        install=_TYPST_INSTALL,
+        update=_TYPST_INSTALL,
+        owned_paths=(".local/share/agent-extras/typst", ".local/bin/typst"),
+        executables=("typst",),
+    ),
+    ExtraPackage(
+        id="claude-code",
+        label="Claude Code",
+        description="Anthropic's official CLI coding agent.",
+        install="curl -fsSL https://claude.ai/install.sh | bash",
+        update="claude update",
+        owned_paths=(".local/bin/claude", ".local/share/claude"),
+        executables=("claude",),
+        agent=AgentLaunch(
+            "claude",
+            "Claude Code",
+            ("--dangerously-skip-permissions",),
+            "Anthropic's official CLI coding agent.",
+        ),
+    ),
+    ExtraPackage(
+        id="codex",
+        label="Codex",
+        description="OpenAI's CLI coding agent (installed via npm).",
+        install="npm install -g @openai/codex",
+        update="npm install -g @openai/codex",
+        uninstall="npm uninstall -g @openai/codex",
+        owned_paths=(".local/bin/codex", ".local/lib/node_modules/@openai/codex"),
+        executables=("codex",),
+        agent=AgentLaunch(
+            "codex",
+            "Codex",
+            ("--dangerously-bypass-approvals-and-sandbox",),
+            "OpenAI's CLI coding agent. Sandbox and approvals are bypassed since the container is the sandbox.",
+        ),
+    ),
+    ExtraPackage(
+        id="mistral-vibe",
+        label="Mistral Vibe",
+        description="Mistral's CLI coding agent (installed as a uv tool).",
+        install="uv tool install mistral-vibe",
+        update="uv tool upgrade mistral-vibe",
+        uninstall="uv tool uninstall mistral-vibe",
+        owned_paths=(".local/bin/vibe", ".local/bin/vibe-acp", ".local/share/uv/tools/mistral-vibe"),
+        executables=("vibe",),
+        agent=AgentLaunch(
+            "vibe",
+            "Mistral Vibe",
+            ("--auto-approve",),
+            "Mistral's CLI coding agent. Tool calls are auto-approved since the container is the sandbox.",
+        ),
+    ),
+    ExtraPackage(
+        id="opencode",
+        label="OpenCode",
+        description="Open-source terminal coding agent.",
+        install="curl -fsSL https://opencode.ai/install | bash",
+        update="opencode upgrade",
+        owned_paths=(".opencode",),
+        executables=("opencode",),
+        agent=AgentLaunch(
+            "opencode",
+            "OpenCode",
+            ("--auto",),
+            "Open-source coding agent. Permissions are auto-approved since the container is the sandbox.",
+        ),
+    ),
+    ExtraPackage(
+        id="ollama",
+        label="Ollama",
+        description="Local model server. Not a coding agent, so it is not launchable.",
+        install=_OLLAMA_INSTALL,
+        update=_OLLAMA_INSTALL,
+        owned_paths=(".local/share/agent-extras/ollama", ".local/bin/ollama"),
+        executables=("ollama",),
+    ),
+)
+
+DEFAULT_EXTRA_PACKAGES: tuple[str, ...] = tuple(p.id for p in EXTRA_REGISTRY)
+DEFAULT_AGENT_ID = "claude-code"
+
+
+def registry_ids(registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> list[str]:
+    return [p.id for p in registry]
+
+
+def extra_by_id(pkg_id: str, registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> ExtraPackage | None:
+    return next((p for p in registry if p.id == pkg_id), None)
+
+
+def launchable_agents(registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> list[ExtraPackage]:
+    """Registry entries that carry coding-agent launch metadata. Non-agent extras
+    (formatters, package managers, model servers) are installable but never
+    appear in the default-agent selector."""
+    return [p for p in registry if p.agent is not None]
+
+
+def remove_command(entry: ExtraPackage) -> str:
+    """The removal routine: the upstream uninstaller when one exists, then a
+    delete of exactly the paths this entry declares it owns. The unconditional
+    path delete is what makes removal reliable when an uninstaller is missing or
+    broken — and it can only ever touch declared paths, never untracked files."""
+    quoted = " ".join(f'"$HOME/{p}"' for p in entry.owned_paths)
+    prefix = f"{entry.uninstall} || true\n" if entry.uninstall else ""
+    return f"{prefix}rm -rf {quoted}\n"
+
+
+# --- Extra-package versions ---------------------------------------------------
+
+# Every managed tool answers `--version`, but each decorates the number
+# differently ("uv 0.11.32 (aarch64…)", "typos-cli 1.48.0", a warning line before
+# the number). The first version-shaped token in the output is the version.
+_VERSION_RE = re.compile(r"\d+\.\d+[\w.+-]*")
+VERSION_PROBE_MARKER = "# agent: report extra-package versions"
+
+
+def version_probe_script(ids: list[str], registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> str:
+    """One script that reports `id<TAB>raw --version output` for every requested
+    package, so a whole report costs a single container run. A tool that is
+    missing or whose `--version` fails simply reports nothing for that line."""
+    specs = " ".join(f'"{e.id}:{e.executables[0]}"' for i in ids if (e := extra_by_id(i, registry)) and e.executables)
+    return (
+        f"{VERSION_PROBE_MARKER}\n"
+        f"for spec in {specs}; do\n"
+        '  id="${spec%%:*}"; exe="${spec#*:}"; out=""\n'
+        '  command -v "$exe" >/dev/null 2>&1 && out=$("$exe" --version 2>&1 | tr "\\n" " ")\n'
+        '  printf \'%s\\t%s\\n\' "$id" "$out"\n'
+        "done\n"
+    )
+
+
+def parse_version_report(stdout: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in stdout.splitlines():
+        pkg, _, raw = line.partition("\t")
+        match = _VERSION_RE.search(raw)
+        if pkg.strip() and match:
+            out[pkg.strip()] = match.group(0)
+    return out
+
+
+# --- Extra-package reconciliation: pure logic --------------------------------
+
+ACTION_INSTALL = "install"
+ACTION_UPDATE = "update"
+ACTION_REMOVE = "remove"
+
+RESULT_INSTALLED = "installed"
+RESULT_UPDATED = "updated"
+RESULT_REMOVED = "removed"
+RESULT_SKIPPED = "skipped"
+RESULT_FAILED = "failed"
+# An update whose reported version did not move: upstream had nothing newer.
+RESULT_UNCHANGED = "up to date"
+
+_ACTION_RESULT = {
+    ACTION_INSTALL: RESULT_INSTALLED,
+    ACTION_UPDATE: RESULT_UPDATED,
+    ACTION_REMOVE: RESULT_REMOVED,
+}
+
+
+@dataclass(frozen=True)
+class ExtraOp:
+    """One planned package operation, in stable registry order."""
+
+    package_id: str
+    action: str
+
+
+def normalize_extra_packages(ids: object, registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> tuple[list[str], list[str]]:
+    """Split a settings selection into (known ids, unknown ids). Unknown entries
+    are reported to the caller so they can be warned about and then ignored —
+    never executed."""
+    if not isinstance(ids, list | tuple):
+        return [], []
+    known = set(registry_ids(registry))
+    selected: list[str] = []
+    unknown: list[str] = []
+    for entry in ids:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        name = entry.strip()
+        if name in known:
+            if name not in selected:
+                selected.append(name)
+        elif name not in unknown:
+            unknown.append(name)
+    return selected, unknown
+
+
+def plan_reconciliation(
+    selected: object,
+    managed: object,
+    registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY,
+) -> tuple[list[ExtraOp], list[str]]:
+    """Decide what to do with every registry entry, walking the registry in its
+    built-in order so behavior and logs are deterministic regardless of settings
+    order. Returns (operations, unmanageable ids).
+
+    - selected, not previously managed  → install
+    - selected, previously managed      → update
+    - previously managed, now deselected → remove
+    - anything else (untracked user tools) → nothing at all
+
+    The second return value is state entries naming packages the registry no
+    longer knows: they cannot be safely removed (their owned paths are unknown),
+    so they are reported and left alone."""
+    chosen, _ = normalize_extra_packages(selected, registry)
+    chosen_set = set(chosen)
+    managed_set = {m for m in managed if isinstance(m, str)} if isinstance(managed, list | tuple | set | dict) else set()
+
+    ops: list[ExtraOp] = []
+    for entry in registry:
+        if entry.id in chosen_set:
+            ops.append(ExtraOp(entry.id, ACTION_UPDATE if entry.id in managed_set else ACTION_INSTALL))
+        elif entry.id in managed_set:
+            ops.append(ExtraOp(entry.id, ACTION_REMOVE))
+    stale = sorted(managed_set - set(registry_ids(registry)))
+    return ops, stale
+
+
+def parse_extras_state(raw: Any) -> dict[str, dict[str, Any]]:
+    """Read the persisted reconciliation state, tolerating anything malformed by
+    degrading to "nothing managed" — an unreadable state file must never cause
+    Agent to delete or re-install at random. A file written by a newer schema is
+    treated the same way: unrecognized, so nothing in it is acted upon."""
+    if not isinstance(raw, dict):
+        return {}
+    schema = raw.get("schema")
+    if schema != EXTRAS_STATE_SCHEMA:
+        warn(f"managed-extras state has unsupported schema {schema!r}; treating it as empty and leaving installed tools alone")
+        return {}
+    packages = raw.get("packages")
+    if not isinstance(packages, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for key, value in packages.items():
+        if not isinstance(key, str):
+            continue
+        status = value.get("status") if isinstance(value, dict) else None
+        out[key] = {"status": status if isinstance(status, str) else RESULT_INSTALLED}
+    return out
+
+
+def extras_state_json(state: dict[str, dict[str, Any]]) -> str:
+    return json.dumps({"schema": EXTRAS_STATE_SCHEMA, "packages": state}, indent=2, sort_keys=True) + "\n"
+
+
+def apply_op_result(state: dict[str, dict[str, Any]], op: ExtraOp, ok: bool) -> dict[str, dict[str, Any]]:
+    """Fold one operation's outcome into the managed-state map.
+
+    A failed install or update is never recorded as a successful managed state; a
+    failed removal *keeps* its entry, so the package stays deselected-but-managed
+    and a later `agent update` retries the removal until it converges."""
+    updated = {k: dict(v) for k, v in state.items()}
+    if op.action == ACTION_REMOVE:
+        if ok:
+            updated.pop(op.package_id, None)
+        else:
+            updated[op.package_id] = {"status": "remove-failed"}
+        return updated
+    if ok:
+        updated[op.package_id] = {"status": RESULT_INSTALLED}
+    elif op.action == ACTION_UPDATE:
+        # Still installed and still managed — just not currently up to date.
+        updated[op.package_id] = {"status": RESULT_FAILED}
+    else:
+        updated.pop(op.package_id, None)
+    return updated
+
+
+def op_command(op: ExtraOp, registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> str | None:
+    """The shell routine for one operation. Install and update are followed by a
+    local verification that every executable the entry declares actually resolves
+    on PATH, so an installer that "succeeds" without producing a working tool is
+    reported as a failure instead of being recorded as managed.
+
+    `set -e` leads, because otherwise only the routine's *last* command decides
+    the exit status: a one-line routine that failed would still be recorded as
+    managed whenever the executable it was supposed to update happened to remain
+    on PATH — which is exactly the case where the old version is still there."""
+    entry = extra_by_id(op.package_id, registry)
+    if entry is None:
+        return None
+    if op.action == ACTION_REMOVE:
+        return remove_command(entry)
+    routine = entry.install if op.action == ACTION_INSTALL else entry.update
+    checks = "".join(
+        f'command -v {exe} >/dev/null || {{ echo "agent: {exe} not found on PATH after {op.action}" >&2; exit 1; }}\n'
+        for exe in entry.executables
+    )
+    return f"set -e\n{routine.rstrip()}\n{checks}"
+
+
+# --- Naming ------------------------------------------------------------------
+
+
+def current_username() -> str:
+    return getpass.getuser()
+
+
+def image_tag(username: str) -> str:
+    return f"{IMAGE_PREFIX}{username}"
+
+
+def home_volume(username: str) -> str:
+    return f"{HOME_VOLUME_PREFIX}{username}"
+
+
+def run_container_name(username: str, mount_root: Path) -> str:
+    """Per-repo persistent container name, keyed by the user and mounted root."""
+    digest = hashlib.sha256(str(mount_root).encode()).hexdigest()[:12]
+    return f"{RUN_CONTAINER_PREFIX}{username}-{digest}"
+
+
+# --- Settings ----------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -125,70 +788,11 @@ class SharedMount:
 
 
 @dataclass(frozen=True)
-class CodingAgent:
-    """A selectable coding agent `agent` can launch by default. `id` is both the
-    settings key and the binary name; `args` are the fixed launch flags
-    (approvals policy) appended before any user-supplied `--` extras."""
-
-    id: str
-    label: str
-    args: tuple[str, ...] = ()
-    description: str = ""
-
-
-# The coding agents baked into the toolchain that `agent` can launch. Each
-# `args` is that agent's approvals flag — the container itself is the sandbox,
-# so approvals are skipped on launch. claude and codex also bypass their own
-# sandbox (claude `--dangerously-skip-permissions`, codex
-# `--dangerously-bypass-approvals-and-sandbox`); opencode `--auto` and vibe
-# `--auto-approve` auto-approve tool calls in-session. `ollama` is a model
-# server, not an interactive coding agent, so it's absent here.
-AGENTS: tuple[CodingAgent, ...] = (
-    CodingAgent(
-        "claude",
-        "Claude Code",
-        ("--dangerously-skip-permissions",),
-        "Anthropic's official CLI coding agent.",
-    ),
-    CodingAgent(
-        "codex",
-        "Codex",
-        ("--dangerously-bypass-approvals-and-sandbox",),
-        "OpenAI's CLI coding agent. Sandbox and approvals are bypassed since the container is the sandbox.",
-    ),
-    CodingAgent(
-        "opencode",
-        "OpenCode",
-        ("--auto",),
-        "Open-source coding agent. Permissions are auto-approved since the container is the sandbox.",
-    ),
-    CodingAgent(
-        "vibe",
-        "Mistral Vibe",
-        ("--auto-approve",),
-        "Mistral's CLI coding agent. Tool calls are auto-approved since the container is the sandbox.",
-    ),
-)
-DEFAULT_AGENT_ID = "claude"
-
-
-def _is_known_agent(agent_id: object) -> bool:
-    return isinstance(agent_id, str) and any(a.id == agent_id for a in AGENTS)
-
-
-def _agent_by_id(agent_id: str) -> CodingAgent:
-    for a in AGENTS:
-        if a.id == agent_id:
-            return a
-    # A stale settings file from a removed agent: fall back to the default
-    # rather than die, mirroring mount_mode's lenient handling.
-    return next(a for a in AGENTS if a.id == DEFAULT_AGENT_ID)
-
-
-@dataclass(frozen=True)
 class Settings:
     mount_mode: str = "repo_root"
     coding_agent: str = DEFAULT_AGENT_ID
+    apt_packages: list[str] = field(default_factory=default_apt_packages)
+    extra_packages: list[str] = field(default_factory=lambda: list(DEFAULT_EXTRA_PACKAGES))
     shared_host_paths: list[SharedMount] = field(default_factory=list)
     env_vars: list[str] = field(default_factory=list)
 
@@ -196,6 +800,8 @@ class Settings:
         return {
             "mount_mode": self.mount_mode,
             "coding_agent": self.coding_agent,
+            "apt_packages": normalize_apt_packages(self.apt_packages),
+            "extra_packages": list(self.extra_packages),
             "shared_host_paths": [m.to_json() for m in self.shared_host_paths],
             "env_vars": list(self.env_vars),
         }
@@ -218,38 +824,30 @@ def _sty(code: str, text: str, *, err: bool = False) -> str:
     return f"\033[{code}m{text}\033[0m" if enabled else text
 
 
-def _bold(s: str) -> str:
-    return _sty("1", s)
-
-
-# Semantic colour helpers (shared CLI style). Backed by `_sty` so NO_COLOR /
-# FORCE_COLOR / tty-detection all keep working through one code path.
-def _c(s: str, code: str) -> str:
-    return _sty(code, s)
-
-
+# Semantic colour helpers (shared CLI style). All backed by `_sty`, so NO_COLOR /
+# FORCE_COLOR / tty-detection keep working through one code path.
 def dim(s: str) -> str:
-    return _c(s, "2")
+    return _sty("2", s)
 
 
 def bold(s: str) -> str:
-    return _c(s, "1")
+    return _sty("1", s)
 
 
 def cyan(s: str) -> str:
-    return _c(s, "36")
+    return _sty("36", s)
 
 
 def green(s: str) -> str:
-    return _c(s, "32")
+    return _sty("32", s)
 
 
 def yellow(s: str) -> str:
-    return _c(s, "33")
+    return _sty("33", s)
 
 
 def red(s: str) -> str:
-    return _c(s, "31")
+    return _sty("31", s)
 
 
 def _progress(msg: str, *, file: TextIO = sys.stdout) -> None:
@@ -370,7 +968,7 @@ def tui_select[T](
         nonlocal rendered
         _erase(rendered)
         prompt = final_message if final_label is not None else message
-        out = [f"{qmark} {_bold(prompt)}"]
+        out = [f"{qmark} {bold(prompt)}"]
         if final_label is None:
             out.append("\n")
             for i, (label, _, _) in enumerate(choices):
@@ -410,13 +1008,21 @@ def tui_select[T](
                 render()
 
 
-def tui_checkbox[T](
+_STATE_BOX = {GROUP_SELECTED: "[x]", GROUP_PARTIAL: "[~]", GROUP_UNSELECTED: "[ ]"}
+
+
+def tui_tristate[T](
     message: str,
-    choices: list[tuple[str, T, bool]],
+    choices: list[tuple[str, T, str]],
     *,
     summary_message: str | None = None,
     details: str | None = None,
-) -> list[T] | None:
+) -> list[tuple[T, str]] | None:
+    """Checkbox list whose entries may start in a third, `partial` state. Toggling
+    a partial or unselected entry selects it fully; toggling a selected entry
+    clears it. An entry the user never touches keeps its partial state, which is
+    what preserves hand-edited settings across an otherwise-default setup run.
+    Returns (value, state) for every entry."""
     _tty_required()
     if not choices:
         return []
@@ -427,7 +1033,7 @@ def tui_checkbox[T](
     approve_idx = len(choices)
 
     idx = approve_idx
-    checked = [c for _, _, c in choices]
+    states = [state for _, _, state in choices]
     rendered = 0
     final_message = summary_message or message
 
@@ -435,9 +1041,9 @@ def tui_checkbox[T](
         nonlocal rendered
         _erase(rendered)
         prompt = final_message if final else message
-        out = [f"{qmark} {_bold(prompt)}"]
+        out = [f"{qmark} {bold(prompt)}"]
         if final:
-            picked = [str(v) for (_, v, _), c in zip(choices, checked, strict=True) if c]
+            picked = [str(v) for (_, v, _), s in zip(choices, states, strict=True) if s != GROUP_UNSELECTED]
             answer = ", ".join(picked) if picked else "(none)"
             out.append(f" {_sty('34', answer)}\n")
         else:
@@ -448,8 +1054,8 @@ def tui_checkbox[T](
                 out.append("\n")
             for i, (label, _, _) in enumerate(choices):
                 prefix = pointer if i == idx else "  "
-                box = "[x]" if checked[i] else "[ ]"
-                if checked[i]:
+                box = _STATE_BOX[states[i]]
+                if states[i] != GROUP_UNSELECTED:
                     box = _sty("34", box)
                 out.append(f"{prefix}{box} {label}\n")
             out.append("\n")
@@ -472,8 +1078,8 @@ def tui_checkbox[T](
             if key in (_KEY_ENTER, _KEY_SPACE):
                 if idx == approve_idx:
                     render(final=True)
-                    return [v for (_, v, _), c in zip(choices, checked, strict=True) if c]
-                checked[idx] = not checked[idx]
+                    return [(v, s) for (_, v, _), s in zip(choices, states, strict=True)]
+                states[idx] = GROUP_UNSELECTED if states[idx] == GROUP_SELECTED else GROUP_SELECTED
                 render()
             elif key == _KEY_UP:
                 idx = (idx - 1) % (len(choices) + 1)
@@ -483,36 +1089,50 @@ def tui_checkbox[T](
                 render()
 
 
+def tui_checkbox[T](
+    message: str,
+    choices: list[tuple[str, T, bool]],
+    *,
+    summary_message: str | None = None,
+    details: str | None = None,
+) -> list[T] | None:
+    """Plain two-state checkbox, expressed through `tui_tristate`."""
+    tri = [(label, value, GROUP_SELECTED if checked else GROUP_UNSELECTED) for label, value, checked in choices]
+    result = tui_tristate(message, tri, summary_message=summary_message, details=details)
+    if result is None:
+        return None
+    return [value for value, state in result if state == GROUP_SELECTED]
+
+
 HELP_TEXT = f"""\
-{_bold("Usage:")} agent [OPTIONS] [SUBCOMMAND] [-- EXTRA_ARGS...]
+{bold("Usage:")} agent [OPTIONS] [SUBCOMMAND] [-- EXTRA_ARGS...]
 
-Launch a Nix-built agent workspace in the current directory.
-With no subcommand, runs the default coding agent (claude). Extra args
-after `--` are forwarded to that agent (or to bash with `shell`).
+Launch a Debian-based agent workspace in the current directory.
+With no subcommand, runs the default coding agent. Extra args after `--`
+are forwarded to that agent (or to bash with `shell`).
 
-{_bold("Options:")}
-  {_bold("--help")}                  Show this help message and exit
-  {_bold("--mount-mode")} MODE       Override workspace mount mode (repo_root|pwd)
-                          (also accepts {_bold("--mount-mode=MODE")})
+{bold("Options:")}
+  {bold("--help")}                  Show this help message and exit
+  {bold("--mount-mode")} MODE       Override workspace mount mode (repo_root|pwd)
+                          (also accepts {bold("--mount-mode=MODE")})
 
-{_bold("Subcommands:")}
-  {_bold("setup")}    Configure agent (interactive)
-  {_bold("shell")}    Open a bash shell instead of the coding agent
-  {_bold("build")}    Build the seed image (via Nix) and exit — rare; routine
-           toolchain bumps go through {_bold("update")}
-  {_bold("update")}   Upgrade the toolchain in place: bump flake.lock, build, and
-           swap the shared /nix profile (no rebuild, no restart)
-  {_bold("stop")}     Remove this repo's persistent container ({_bold("--all")} for every repo)
-  {_bold("clean")}    Session-respecting reclaim: prune stopped containers + GC the
-           shared store ({_bold("--force")} also kills live sessions)
-  {_bold("reset")}    Delete the shared /nix volume and reseed from the image
-  {_bold("check")}    Validate the Nix expression without building
-  {_bold("doctor")}   Run environment health checks ({_bold("--json")} for machine output;
+{bold("Subcommands:")}
+  {bold("setup")}    Configure agent (interactive)
+  {bold("shell")}    Open a bash shell instead of the coding agent
+  {bold("build")}    Rebuild the Debian image from the selected APT packages
+           (always pulls a fresh base; {bold("--refresh")} also reinstalls every
+           package from scratch), then reconcile native extra tools
+  {bold("update")}   Install, update, and remove native extra tools in the shared
+           home volume (no APT upgrade, no image rebuild)
+  {bold("stop")}     Remove this repo's persistent container ({bold("--all")} for every repo)
+  {bold("clean")}    Remove stopped agent containers and unused agent images
+           ({bold("--force")} also kills live sessions)
+  {bold("doctor")}   Report local environment state ({bold("--json")} for machine output;
            exits 1 if any check needs attention)
-  {_bold("help")}     Show this help message and exit
+  {bold("help")}     Show this help message and exit
 """
 
-SUBCOMMANDS = {"setup", "shell", "build", "update", "stop", "clean", "reset", "check", "doctor", "help"}
+SUBCOMMANDS = {"setup", "shell", "build", "update", "stop", "clean", "doctor", "help"}
 
 
 def die(msg: str) -> NoReturn:
@@ -571,6 +1191,27 @@ def _parse_env_vars(raw: Any, path: Path) -> list[str]:
     return result
 
 
+def _parse_apt_packages(raw: Any, path: Path) -> list[str]:
+    if raw is None:
+        return default_apt_packages()
+    if not isinstance(raw, list):
+        warn(f"apt_packages in {path} is not a list; using the default selection")
+        return default_apt_packages()
+    return normalize_apt_packages(raw)
+
+
+def _parse_extra_packages(raw: Any, path: Path) -> list[str]:
+    if raw is None:
+        return list(DEFAULT_EXTRA_PACKAGES)
+    if not isinstance(raw, list):
+        warn(f"extra_packages in {path} is not a list; using the default selection")
+        return list(DEFAULT_EXTRA_PACKAGES)
+    selected, unknown = normalize_extra_packages(raw)
+    for name in unknown:
+        warn(f"ignoring unknown extra package {name!r} in {path}")
+    return selected
+
+
 def load_settings() -> Settings:
     path = settings_path()
     try:
@@ -583,22 +1224,23 @@ def load_settings() -> Settings:
         die(f"malformed settings file {path}: {e}\nRun `agent setup` to recreate it.")
     if not isinstance(loaded, dict):
         die(f"malformed settings file {path}: expected JSON object\nRun `agent setup` to recreate it.")
-    known = {"mount_mode", "shared_host_paths", "env_vars", "coding_agent"}
+    known = {"mount_mode", "shared_host_paths", "env_vars", "coding_agent", "apt_packages", "extra_packages"}
     for key in loaded:
-        if key in known or key == "container_engine":  # container_engine: obsolete, docker-only now
-            continue
-        warn(f"ignoring unknown setting {key!r} in {path}")
+        if key not in known:
+            warn(f"ignoring unknown setting {key!r} in {path}")
     mount_mode = loaded.get("mount_mode", "repo_root")
     if mount_mode not in {"pwd", "repo_root"}:
         warn(f"unknown mount_mode {mount_mode!r} in {path}; using 'repo_root'")
         mount_mode = "repo_root"
     coding_agent = loaded.get("coding_agent", DEFAULT_AGENT_ID)
-    if not _is_known_agent(coding_agent):
+    if coding_agent not in {p.id for p in launchable_agents()}:
         warn(f"unknown coding_agent {coding_agent!r} in {path}; using {DEFAULT_AGENT_ID!r}")
         coding_agent = DEFAULT_AGENT_ID
     return Settings(
         mount_mode=mount_mode,
         coding_agent=coding_agent,
+        apt_packages=_parse_apt_packages(loaded.get("apt_packages"), path),
+        extra_packages=_parse_extra_packages(loaded.get("extra_packages"), path),
         shared_host_paths=_parse_shared_mounts(loaded.get("shared_host_paths", []), path),
         env_vars=_parse_env_vars(loaded.get("env_vars", []), path),
     )
@@ -618,6 +1260,17 @@ def save_settings(settings: Settings) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _launch_agent(agent_id: str) -> AgentLaunch:
+    entry = extra_by_id(agent_id)
+    if entry is not None and entry.agent is not None:
+        return entry.agent
+    # A stale settings file naming a removed agent: fall back to the default
+    # rather than die, mirroring mount_mode's lenient handling.
+    default = extra_by_id(DEFAULT_AGENT_ID)
+    assert default is not None and default.agent is not None
+    return default.agent
 
 
 def _ask_questions(current: Settings) -> Settings | None:
@@ -652,9 +1305,10 @@ def _ask_questions(current: Settings) -> Settings | None:
         return None
 
     agent_choices: list[tuple[str, str, str]] = []
-    for a in AGENTS:
-        label = f"{a.label} {default_marker}" if a.id == DEFAULT_AGENT_ID else a.label
-        agent_choices.append((label, a.id, a.description))
+    for entry in launchable_agents():
+        assert entry.agent is not None
+        label = f"{entry.agent.label} {default_marker}" if entry.id == DEFAULT_AGENT_ID else entry.agent.label
+        agent_choices.append((label, entry.id, entry.agent.description))
     coding_agent = tui_select(
         "Which coding agent should `agent` launch by default?",
         agent_choices,
@@ -662,6 +1316,41 @@ def _ask_questions(current: Settings) -> Settings | None:
         summary_message="Default coding agent",
     )
     if coding_agent is None:
+        return None
+
+    group_choices: list[tuple[str, str, str]] = [
+        (f"{g.label}  {dim(', '.join(g.packages))}", g.id, group_state(g, current.apt_packages)) for g in APT_GROUPS
+    ]
+    custom = custom_apt_packages(current.apt_packages)
+    custom_note = f"\nCustom packages kept as-is: {', '.join(custom)}." if custom else ""
+    group_states = tui_tristate(
+        "Which Debian package groups should the image contain?",
+        group_choices,
+        summary_message="Debian package groups",
+        details=(
+            "Groups are installed with apt during `agent build`.\n"
+            "[~] means settings select only part of a group; leave it alone to keep that.\n"
+            "Edit apt_packages in settings.json for individual or custom package names." + custom_note
+        ),
+    )
+    if group_states is None:
+        return None
+    apt_packages = apply_group_states(current.apt_packages, group_states)
+
+    extra_choices: list[tuple[str, str, bool]] = [
+        (f"{e.label}  {dim(e.description)}", e.id, e.id in current.extra_packages) for e in EXTRA_REGISTRY
+    ]
+    extra_packages = tui_checkbox(
+        "Which native extra tools should be installed in your home volume?",
+        extra_choices,
+        summary_message="Native extra tools",
+        details=(
+            "These are installed with their own upstream installers into the\n"
+            "persistent home volume shared by all your repositories, and are\n"
+            "installed, updated, or removed by `agent update`."
+        ),
+    )
+    if extra_packages is None:
         return None
 
     selected_builtin_hosts = {m.host for m in current.shared_host_paths if m.builtin}
@@ -690,7 +1379,14 @@ def _ask_questions(current: Settings) -> Settings | None:
             return None
         shared_host_paths = shared
 
-    return replace(current, mount_mode=mount_mode, coding_agent=coding_agent, shared_host_paths=shared_host_paths)
+    return replace(
+        current,
+        mount_mode=mount_mode,
+        coding_agent=coding_agent,
+        apt_packages=apt_packages,
+        extra_packages=extra_packages,
+        shared_host_paths=shared_host_paths,
+    )
 
 
 def run_setup() -> None:
@@ -711,802 +1407,413 @@ def run_setup() -> None:
 
     print()
     print(f"{_sty('1;32', '✓')} Saved.")
+    # Saving never builds or installs: configuration changes must not silently
+    # start a slow networked build.
+    apt_changed = normalize_apt_packages(current.apt_packages) != normalize_apt_packages(updated.apt_packages)
+    extras_changed = sorted(current.extra_packages) != sorted(updated.extra_packages)
+    if apt_changed:
+        print(f"  {dim('Debian packages changed — run `agent build` to rebuild the image.')}")
+    if extras_changed:
+        print(f"  {dim('Extra tools changed — run `agent update` to apply them.')}")
 
 
-@dataclass
-class Probe:
-    """One-shot readings from a throwaway container against the shared /nix store.
-    Toolchain versions and the NOFILE limit are properties of that shared store
-    (mounted into every container), so we read them ONCE here rather than per
-    container. `generation` is the current default-profile generation number;
-    `lock_date` is the host-side date `flake.lock` was last committed (i.e. the
-    last `agent update`)."""
+# --- Docker helpers ----------------------------------------------------------
 
-    claude: str | None
-    opencode: str | None
-    nofile: str | None  # decimal string, "unlimited", or None
-    generation: int | None
-    # Drift detection: `applied` is the store path the default profile points at
-    # now; `desired` is what the *current* flake.lock evaluates to (pure, offline).
-    # `desired is None` means the eval couldn't answer offline (e.g. a seed store
-    # lacking the flake's eval sources) — report "unknown", never a false match.
-    applied: str | None = None
-    desired: str | None = None
-    lock_date: str | None = None
+_DOCKER_INSTALL_HINT = "https://docs.docker.com/get-docker/"
 
 
-def _probe_toolchain(engine: str, image: str, volume: str) -> Probe | None:
-    """Read claude/opencode versions, the NOFILE hard limit, and the profile
-    generation in a single throwaway run against the shared store. Mounts the
-    shared /nix volume when it exists so we see the *current* (post-`agent
-    update`) toolchain, not the image's baked seed. None if the image isn't built.
+def _run_quiet(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(cmd, capture_output=True, check=False)
 
-    Does *not* compute `desired` (the flake-drift eval) — `run_doctor` runs that as
-    a separate concurrent task so probe + eval don't serialize. Runs `die()`-free so
-    it's safe in a worker thread: a probe failure returns None (the check degrades to
-    "not checked", exactly like an absent image)."""
-    if not image_exists(engine, image):
-        return None
-    have_volume = _volume_exists(engine, volume)
-    vol_mount = ["-v", f"{volume}:/nix"] if have_volume else []
-    script = (
-        'printf "C:%s\\n" "$(claude --version 2>/dev/null | head -1)"; '
-        'printf "O:%s\\n" "$(opencode --version 2>/dev/null | head -1)"; '
-        'printf "N:%s\\n" "$(ulimit -Hn)"; '
-        f'printf "G:%s\\n" "$(readlink {DEFAULT_PROFILE} 2>/dev/null)"; '
-        f'printf "A:%s\\n" "$(readlink -f {DEFAULT_PROFILE} 2>/dev/null)"'
-    )
-    r = subprocess.run(
-        # `--pull=never`: the image is already present (guarded above), so this
-        # read never reaches a registry — the offline guarantee, made explicit and
-        # refactor-proof rather than resting on the implicit `image_exists` guard.
-        [engine, "run", "--rm", "--pull=never", *vol_mount, image, "sh", "-c", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+
+def _run_text(cmd: list[str], *, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, input=stdin, capture_output=True, text=True, check=False)
+
+
+def check_engine(engine: str, *, quiet: bool = False) -> None:
+    """`quiet` suppresses the progress pair: `agent doctor --json` needs stdout to
+    stay clean JSON, and this runs before doctor's own as_json branch even exists."""
+    if not shutil.which(engine):
+        die(f"{engine} not in PATH\nInstall: {_DOCKER_INSTALL_HINT}")
+
+    # Runs on every invocation and is usually instant, but `engine info` can take
+    # several seconds if the daemon is still cold-starting — print before, not after.
+    if not quiet:
+        _progress(f"{_sty('1;34', '→')} Checking {engine}...")
+    info = _run_quiet([engine, "info"])
+    if info.returncode != 0:
+        stderr = info.stderr.decode(errors="replace").strip()
+        die(f"`{engine} info` failed:\n{stderr}")
+    if not quiet:
+        _progress(f"{_sty('1;32', '✓')} {engine} ready.")
+
+
+def short_id(image_id: str) -> str:
+    """Docker's short form of a full image id, as `docker images` prints it."""
+    return image_id.removeprefix("sha256:")[:12]
+
+
+def image_exists(engine: str, image: str) -> bool:
+    return _run_quiet([engine, "image", "inspect", image]).returncode == 0
+
+
+def _volume_exists(engine: str, volume: str) -> bool:
+    return _run_quiet([engine, "volume", "inspect", volume]).returncode == 0
+
+
+def _image_id(engine: str, image: str) -> str:
+    return _run_text([engine, "image", "inspect", "--format", "{{.Id}}", image]).stdout.strip()
+
+
+def image_apt_fingerprint(engine: str, image: str) -> str | None:
+    """The APT-selection fingerprint baked into the image, or None when the image
+    is absent or predates the label."""
+    r = _run_text([engine, "image", "inspect", "--format", f'{{{{index .Config.Labels "{APT_FINGERPRINT_LABEL}"}}}}', image])
     if r.returncode != 0:
-        # No `die()`: this runs in a doctor worker thread, where a `SystemExit`
-        # would abort the whole report. Degrade to "not checked" like an absent image.
         return None
-    fields: dict[str, str] = {}
-    for line in r.stdout.splitlines():
-        key, _, val = line.partition(":")
-        fields[key] = val.strip()
-    claude_raw = fields.get("C", "")
-    return Probe(
-        claude=claude_raw.split()[0] if claude_raw else None,
-        opencode=fields.get("O") or None,
-        nofile=fields.get("N") or None,
-        generation=parse_generation(fields.get("G", "")),
-        applied=fields.get("A") or None,
-    )
-
-
-def _desired_toolchain(engine: str, image: str, volume: str) -> str | None:
-    """The store path the *current* flake.lock evaluates to — pure and offline, as
-    root (taking the store's db lock the `agent` user can't). `--offline` so a seed
-    store lacking the flake's eval sources fails fast rather than hitting the
-    network; a failed/empty eval returns None, read downstream as "sync unknown"
-    (never a false in-sync)."""
-    r = _shared_root(
-        engine,
-        image,
-        volume,
-        "nix eval --raw --offline path:/build#toolchain 2>/dev/null || true",
-        extra_mounts=[f"{SCRIPT_DIR / 'agent-image'}:/build:ro"],
-    )
-    path = r.stdout.strip()
-    return path if path.startswith("/nix/store/") else None
+    value = r.stdout.strip()
+    return value or None
 
 
 def _docker_version(engine: str) -> str:
-    r = subprocess.run(
-        [engine, "version", "--format", "{{.Server.Version}}"],
-        capture_output=True,
-        text=True,
-        check=False,
+    return _run_text([engine, "version", "--format", "{{.Server.Version}}"]).stdout.strip() or "unknown"
+
+
+def _list_run_containers(engine: str, *, prefix: str = RUN_CONTAINER_PREFIX, running_only: bool = False) -> list[str]:
+    """Names of persistent agent containers. `prefix` defaults to the general
+    `agent-run-` namespace, which spans every user visible on this Docker host."""
+    cmd = [engine, "ps"] if running_only else [engine, "ps", "-a"]
+    cmd += ["--filter", f"name={prefix}", "--format", "{{.Names}}"]
+    r = _run_text(cmd)
+    return [n.strip() for n in r.stdout.splitlines() if n.strip()]
+
+
+def _images_in_use(engine: str) -> set[str]:
+    """Short image ids referenced by any existing container (running or stopped)."""
+    r = _run_text([engine, "ps", "-aq", "--no-trunc"])
+    if r.returncode != 0 or not r.stdout.strip():
+        return set()
+    container_ids = [c.strip() for c in r.stdout.splitlines() if c.strip()]
+    ri = _run_text([engine, "inspect", "--format", "{{.Image}}", *container_ids])
+    image_ids: set[str] = set()
+    if ri.returncode == 0:
+        for raw in ri.stdout.splitlines():
+            raw = raw.strip()
+            if raw:
+                image_ids.add(short_id(raw))
+    return image_ids
+
+
+def _clean_step(label: str, cmd: list[str], *, missing_ok: bool = False) -> None:
+    _progress(f"{_sty('1;34', '→')} {label}...")
+    r = _run_quiet(cmd)
+    stderr = r.stderr.decode(errors="replace").strip()
+    if r.returncode == 0:
+        print(f"{_sty('1;32', '✓')} {label}.")
+        return
+    if missing_ok:
+        missing_markers = ("No such image", "No such object", "No such volume", "not found")
+        if any(marker in stderr for marker in missing_markers):
+            print(f"{_sty('2', '•')} {label}: already absent.")
+            return
+    warn(f"{label} failed: {stderr or f'exit {r.returncode}'}")
+
+
+# --- Per-user build/update lock ----------------------------------------------
+
+
+def _lock_path(username: str) -> Path:
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-container"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"maintenance-{username}.lock"
+
+
+@contextlib.contextmanager
+def maintenance_lock(username: str) -> Iterator[None]:
+    """Host-side exclusive lock shared by `agent build` and `agent update`. All
+    repositories for a user share one mutable home volume and one extras-state
+    file, so installers and state writes must never overlap. A concurrent
+    invocation blocks here until the holder finishes."""
+    path = _lock_path(username)
+    with path.open("w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            _progress(f"{_sty('1;34', '→')} Another `agent build`/`agent update` is running; waiting...")
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+# --- Image build -------------------------------------------------------------
+
+
+def image_path_prefix() -> str:
+    """The native-installer bin directories, as a PATH fragment."""
+    return ":".join(f"{CONTAINER_HOME}/{d}" for d in HOME_BIN_DIRS)
+
+
+def _login_profile_script() -> str:
+    """A login shell runs /etc/profile, which rebuilds PATH from scratch and drops
+    the image's `ENV PATH`. This snippet puts the native-installer directories
+    back, so `bash -lc` sees exactly what a `docker exec` session sees."""
+    dirs = " \\\n  ".join(f'"$HOME/{d}"' for d in HOME_BIN_DIRS)
+    return (
+        "# Generated by `agent build` from HOME_BIN_DIRS. Do not edit.\n"
+        f"for d in \\\n  {dirs}; do\n"
+        '  case ":$PATH:" in\n'
+        '  *":$d:"*) ;;\n'
+        '  *) PATH="$d:$PATH" ;;\n'
+        "  esac\n"
+        "done\n"
+        "export PATH\n"
     )
-    return r.stdout.strip() or "unknown"
 
 
-def _flake_lock_date() -> str | None:
-    """Host-side date `agent-image/flake.lock` was last committed — a reliable
-    proxy for the last `agent update` (in-container profile mtimes are epoch-zeroed
-    by nix2container, so the filesystem can't tell us)."""
-    r = subprocess.run(
-        ["git", "-C", str(SCRIPT_DIR), "log", "-1", "--format=%cs", "--", "agent-image/flake.lock"],
-        capture_output=True,
-        text=True,
-        check=False,
+def _write_build_context(context: Path, packages: list[str], fingerprint: str) -> None:
+    """Assemble the temporary build context: the version-controlled Dockerfile
+    and static root overlay, plus the generated package list, login-shell profile
+    snippet, and image metadata."""
+    shutil.copy2(IMAGE_DIR / "Dockerfile", context / "Dockerfile")
+    shutil.copytree(IMAGE_DIR / "root", context / "root")
+    profile_d = context / "root" / "etc" / "profile.d"
+    profile_d.mkdir(parents=True, exist_ok=True)
+    (profile_d / "agent.sh").write_text(_login_profile_script())
+    (context / "apt-packages.txt").write_text("".join(f"{p}\n" for p in packages))
+    (context / "image-metadata.json").write_text(
+        json.dumps({"schema": 1, "apt_fingerprint": fingerprint, "apt_packages": packages}, indent=2) + "\n"
     )
-    return r.stdout.strip() or None
 
 
-_NOFILE_FIX_DOCKER_DARWIN = r"""# Open Docker Desktop → Settings → Docker Engine and merge into the JSON:
-#   "default-ulimits": {
-#     "nofile": { "Name": "nofile", "Hard": 524288, "Soft": 524288 }
-#   }
-# Click "Apply & restart"."""
+def build_image(engine: str, image: str, settings: Settings, *, refresh: bool) -> None:
+    """Build the image from the configured APT selection. Always `--pull`, so a
+    republished base image invalidates the layers below it and the packages are
+    reinstalled from the current Debian archive; otherwise cached layers are
+    reused and an unchanged rebuild costs nothing. `refresh` adds `--no-cache`
+    for an unconditional reinstall. Running containers are never touched: a
+    stopped container whose fingerprint no longer matches is recreated lazily on
+    its next launch."""
+    packages = normalize_apt_packages(settings.apt_packages)
+    if not packages:
+        die("apt_packages is empty; run `agent setup` to choose at least one package group")
+    fingerprint = apt_fingerprint(packages)
+    uid, gid = os.getuid(), os.getgid()
+    previous = short_id(_image_id(engine, image))
 
-_NOFILE_FIX_DOCKER_LINUX = r"""sudo mkdir -p /etc/docker
-# Edit /etc/docker/daemon.json and merge in:
-#   "default-ulimits": {
-#     "nofile": { "Name": "nofile", "Hard": 524288, "Soft": 524288 }
-#   }
-sudo systemctl reload docker"""
+    print(f"{_sty('1;35', '⬢')} {bold('build → image')} {dim(f'({len(packages)} apt packages)')}")
+    mode = "fresh pull, no cache" if refresh else "fresh pull, cached layers reused"
+    _progress(f"  {_sty('1;34', '→')} Building {image} from {BASE_IMAGE}  {dim(f'({mode})')}")
+    with tempfile.TemporaryDirectory(prefix="agent-build-") as tmp:
+        context = Path(tmp)
+        _write_build_context(context, packages, fingerprint)
+        cmd = [
+            engine,
+            "build",
+            "--pull",
+            *(["--no-cache"] if refresh else []),
+            "--tag",
+            image,
+            "--build-arg",
+            f"AGENT_UID={uid}",
+            "--build-arg",
+            f"AGENT_GID={gid}",
+            "--build-arg",
+            f"AGENT_APT_FINGERPRINT={fingerprint}",
+            "--build-arg",
+            f"AGENT_PATH={image_path_prefix()}",
+            str(context),
+        ]
+        rc = subprocess.run(cmd, check=False).returncode
+    if rc != 0:
+        die(f"image build failed (exit {rc})\nAPT is the authority on package names — check `apt_packages` in your settings.")
+    print(f"  {_sty('1;32', '✓')} Image {image} ready  {dim(f'(apt {fingerprint})')}")
 
-# is_darwin → fix block
-_NOFILE_FIX: dict[bool, str] = {
-    True: _NOFILE_FIX_DOCKER_DARWIN,
-    False: _NOFILE_FIX_DOCKER_LINUX,
-}
-
-
-def _doctor_block(text: str) -> None:
-    bar = dim("│")
-    for line in text.split("\n"):
-        print(f"    {bar} {dim(line) if line.startswith('#') else cyan(line)}")
-
-
-# One glyph + colour per severity, so status survives colour-blindness, monochrome
-# pipes, and `grep` (colour only reinforces). Ordered nominal → must-act.
-#   ok   nominal            info  noteworthy but self-resolving (drift, unknowns)
-#   warn you may act        fail  you must act (blocks a healthy run)
-_DOCTOR_GLYPH = {"ok": ("✓", green), "info": ("•", cyan), "warn": ("!", yellow), "fail": ("✗", red)}
-_DOCTOR_LABEL_W = 16
-
-
-def _col(styled: str, width: int) -> str:
-    """Left-justify to `width` *visible* columns (colour codes don't count)."""
-    return styled + " " * max(0, width - _visible_width(styled))
-
-
-_SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([A-Za-z]+)\s*$")
-
-
-def _fmt_size(size: str | None, *, round_int: bool = False) -> str:
-    """Docker's sizes come glued (`54.36GB`); render them spaced (`54.36 GB`), and
-    optionally rounded to a whole number for compact summaries (`32 GB`). Anything
-    that doesn't parse passes through untouched."""
-    if not size:
-        return ""
-    m = _SIZE_RE.match(size)
-    if not m:
-        return size
-    num, unit = m.group(1), m.group(2)
-    if round_int:
-        with contextlib.suppress(ValueError):
-            num = str(round(float(num)))
-    return f"{num} {unit}"
+    # The old image is only removed once nothing references it, so a running
+    # session on the superseded build stays valid.
+    current = short_id(_image_id(engine, image))
+    if previous and previous != current and previous not in _images_in_use(engine):
+        _run_quiet([engine, "rmi", previous])
 
 
-@dataclass
-class DoctorCheck:
-    """One health check's result. `value` is the primary reading; `detail` is dim
-    identifying context after a `·`; `note` is a dim parenthetical; `fix` is a
-    one-line remediation (shown in `--json` and, for `fail`, expanded into the
-    `why`/`fix_block` remediation block)."""
-
-    status: str  # ok | info | warn | fail
-    label: str
-    value: str
-    detail: str = ""
-    note: str = ""
-    fix: str = ""
-    why: list[str] = field(default_factory=list)
-    fix_block: str = ""
+# --- Extra-package reconciliation: orchestration ------------------------------
 
 
-def _safe_result[T](future: concurrent.futures.Future[T], default: T) -> T:
-    """Read one doctor collection future, degrading any failure to `default` so a
-    single broken read renders as "unavailable" instead of aborting the whole
-    report. A worker's exception is stored on the future and re-raised here by
-    `.result()`; catching `SystemExit` alongside `Exception` contains any `die()`
-    reachable from a worker (a `BaseException` that `except Exception` would miss,
-    letting it kill the doctor — the exact failure isolation is meant to prevent).
-    `KeyboardInterrupt` still propagates."""
-    try:
-        return future.result()
-    except (Exception, SystemExit):
-        return default
-
-
-def run_doctor(engine: str, image: str, settings: Settings, *, as_json: bool = False) -> None:
-    """Environment health. Collect every read concurrently, then render once (text
-    or JSON). The reads are subprocess/IO-bound (docker/nix/git), so a thread pool
-    collapses the three slow serial calls — the shared-store probe, the flake-drift
-    eval, and the `system df -v` volume sweep — into a single wall-clock wait (~2x
-    faster warm). Each read is isolated (see `_safe_result`): a failure degrades
-    that one line, never the whole report. Exit 1 iff any check is `fail` (a blocking
-    problem); `warn`/`info` stay exit 0 so `agent doctor && …` and CI aren't
-    tripped by advisory hints."""
-    volume = nix_shared_volume(getpass.getuser())
-    # Guard the store-touching reads once, up front: with no built image there's
-    # nothing to probe, and mounting an absent /nix volume would make docker create
-    # an empty one as a side effect. Both degrade to "not checked".
-    img_ok = image_exists(engine, image)
-    have_volume = img_ok and _volume_exists(engine, volume)
-
-    # stderr, not stdout: `--json` needs stdout to stay clean JSON, and this line
-    # is transient status, not part of the report — the report itself is the
-    # completion signal, so there's no matching "done" line.
-    _progress(f"{_sty('1;34', '→', err=True)} Checking environment...", file=sys.stderr)
-
-    # Raw reads submitted so ty infers each `Future[…]` cleanly; `_safe_result`
-    # extracts them after join.
-    with concurrent.futures.ThreadPoolExecutor() as ex:
-        f_probe = ex.submit(_probe_toolchain, engine, image, volume) if img_ok else None
-        f_desired = ex.submit(_desired_toolchain, engine, image, volume) if have_volume else None
-        f_version = ex.submit(_docker_version, engine)
-        f_containers = ex.submit(_run_container_details, engine, settings, image)
-        f_tag_map = ex.submit(_image_tag_map, engine)
-        f_volumes = ex.submit(_agent_volumes, engine)
-        f_vol_sizes = ex.submit(_volume_sizes, engine)
-        f_image_id = ex.submit(_image_id, engine, image)
-        f_ages = ex.submit(_image_ages, engine)
-        f_lock_date = ex.submit(_flake_lock_date)
-
-    probe = _safe_result(f_probe, None) if f_probe else None
-    if probe is not None:
-        # Merge the separately-collected drift eval and lock date onto the probe.
-        probe.desired = _safe_result(f_desired, None) if f_desired else None
-        probe.lock_date = _safe_result(f_lock_date, None)
-
-    checks = [
-        DoctorCheck("ok", "docker", "running", detail=f"v{_safe_result(f_version, 'unknown')}"),
-        _check_toolchain(probe),
-        # `_check_nofile` runs here in the main thread on purpose: an unexpected
-        # NOFILE value is a genuine `die()`, and must stay fatal — not be swallowed
-        # by a worker's error isolation.
-        _check_nofile(probe.nofile if probe else None),
-    ]
-    containers = _safe_result(f_containers, [])
-    tag_map = _safe_result(f_tag_map, {})
-    volumes = _safe_result(f_volumes, [])
-    vol_sizes = _safe_result(f_vol_sizes, {})
-    current_short = _safe_result(f_image_id, "").removeprefix("sha256:")[:12] or None
-    ages = _safe_result(f_ages, {})
-
-    if as_json:
-        _doctor_json(checks, containers, tag_map, volumes, vol_sizes)
-    else:
-        _doctor_render(checks, containers, tag_map, volumes, vol_sizes, current_short, ages)
-
-    # Only the checks gate the exit code; the container/image/volume inventory is
-    # informational and must never trip `agent doctor && …`.
-    if any(c.status == "fail" for c in checks):
-        sys.exit(1)
-
-
-def _check_toolchain(probe: Probe | None) -> DoctorCheck:
-    """The shared toolchain: claude/opencode versions, plus the profile generation
-    and last-update date. One reading for the whole install (the store is shared)."""
-    if probe is None:
-        return DoctorCheck("info", "toolchain", "not checked", note="run `agent build` first")
-    parts = []
-    if probe.claude:
-        parts.append(f"claude {probe.claude}")
-    if probe.opencode:
-        parts.append(f"opencode {probe.opencode}")
-    value = " · ".join(parts) if parts else "unknown"
-    detail_bits = []
-    if probe.generation is not None:
-        detail_bits.append(f"gen {probe.generation}")
-    # Generation 1 is the image's baked seed — no `agent update` has run, so there
-    # is no update date to show (the flake.lock date would misreport "updated").
-    if probe.generation == 1:
-        detail_bits.append("seed")
-    elif probe.lock_date:
-        detail_bits.append(f"updated {probe.lock_date}")
-
-    # Drift: does the applied store path match what the current flake.lock builds?
-    # `desired is None` means the eval couldn't answer offline — say "sync unknown",
-    # never imply in-sync. A real mismatch is advisory (`warn`), so it can't trip
-    # `agent doctor && …`; the fix is the routine, live-safe `agent update`. On a
-    # gen-1 seed the "seed" tag already explains the unknown, so don't repeat it.
-    if probe.desired is None:
-        if probe.generation != 1:
-            detail_bits.append("sync unknown")
-    elif probe.applied and probe.applied != probe.desired:
-        # The drift reason is the warn's advisory item (dejargoned — no `flake.lock`/nix
-        # in the user-facing text); the neutral detail column stays clean.
-        return DoctorCheck(
-            "warn",
-            "toolchain",
-            value,
-            detail=" · ".join(detail_bits),
-            fix="a newer toolchain is ready — run `agent update`",
-        )
-    return DoctorCheck("ok", "toolchain", value, detail=" · ".join(detail_bits))
-
-
-def _check_nofile(nofile: str | None) -> DoctorCheck:
-    """NOFILE hard limit, already read by the shared-store probe. `ample`/`too low`
-    reads as a verdict on its own — the bare number alone said nothing."""
-    warn_at = 1024
-    recommended = 524288
-    if nofile is None:
-        return DoctorCheck("info", "open files", "not checked", note="run `agent build` first")
-    if nofile == "unlimited":
-        return DoctorCheck("ok", "open files", "unlimited", detail="ample")
-    try:
-        limit = int(nofile)
-    except ValueError:
-        die(f"unexpected NOFILE value from agent container: {nofile!r}")
-    if limit > warn_at:
-        return DoctorCheck("ok", "open files", str(limit), detail="ample")
-    where = "Docker Desktop settings" if sys.platform == "darwin" else "docker daemon.json"
-    # `nofile` stays literal: it's the actual daemon `default-ulimits` config key.
-    return DoctorCheck(
-        "fail",
-        "open files",
-        str(limit),
-        detail=f"too low — want ≥{recommended}",
-        fix=f"raise the nofile ulimit in {where}, then rebuild",
-        why=[
-            "The 1024 hard cap is a systemd default, kept for select(2) safety.",
-            "Heavy parallel builds (e.g. `lake build`) blow past it.",
+def _updater_run(engine: str, image: str, volume: str, script: str, *, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    """Run one command in a transient container as the normal Agent user, with
+    the shared home volume mounted and normal network access. `bash -lc` so the
+    command sees the same login-shell environment and PATH as a real session."""
+    uid, gid = os.getuid(), os.getgid()
+    return _run_text(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--interactive",
+            "--pull=never",
+            "--user",
+            f"{uid}:{gid}",
+            "-v",
+            f"{volume}:{CONTAINER_HOME}",
+            "-e",
+            f"HOME={CONTAINER_HOME}",
+            image,
+            "bash",
+            "-lc",
+            script,
         ],
-        fix_block=_NOFILE_FIX[sys.platform == "darwin"],
+        stdin=stdin or "",
     )
 
 
-@dataclass
-class RunContainer:
-    """A persistent `agent-run-*` container, with just enough to place it in the
-    image→container tree and say whether the next call would recreate it."""
-
-    name: str
-    running: bool
-    image_short: str
-    path: Path | None
-    fresh: bool | None  # None when the mounted repo path couldn't be recovered
-
-
-def _run_container_details(engine: str, settings: Settings, image: str) -> list[RunContainer]:
-    """Inspect every persistent container for this user. Freshness reuses the run
-    path's `build_run_spec` fingerprint, so `up to date`/`config drift` predicts the
-    next call exactly. The repo path is the one bind whose source == destination."""
-    out: list[RunContainer] = []
-    fmt = (
-        "{{.State.Running}}\t{{.Image}}\t"
-        '{{index .Config.Labels "agent.fingerprint"}}\t'
-        "{{range .Mounts}}{{.Source}}={{.Destination}};{{end}}"
-    )
-    for name in _list_run_containers(engine):
-        r = subprocess.run(
-            [engine, "inspect", "--format", fmt, name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if r.returncode != 0:
-            continue
-        running_s, _, rest = r.stdout.rstrip("\n").partition("\t")
-        img, _, rest = rest.partition("\t")
-        stored_fp, _, mounts_s = rest.partition("\t")
-        path = _repo_mount_path(mounts_s)
-        fresh: bool | None = None
-        if path is not None:
-            fresh = stored_fp == build_run_spec(engine, settings, image, path).fingerprint
-        out.append(
-            RunContainer(
-                name=name,
-                running=running_s == "true",
-                image_short=img.removeprefix("sha256:")[:12],
-                path=path,
-                fresh=fresh,
-            )
-        )
-    return out
-
-
-def _repo_mount_path(mounts_s: str) -> Path | None:
-    """The repo bind is the one mounted at the same path inside as out
-    (`{root}:{root}`). Docker Desktop may prefix the host source with `/host_mnt`,
-    so compare against that stripped too. The destination IS the repo path."""
-    for m in mounts_s.split(";"):
-        src, _, dst = m.partition("=")
-        if not (src and dst):
-            continue
-        normalized = src.removeprefix("/host_mnt")
-        if dst in (src, normalized):
-            return Path(dst)
-    return None
-
-
-def _image_tag_map(engine: str) -> dict[str, str]:
-    """Short image id → an `agent:*` tag. A rebuilt image leaves old containers
-    pointing at a now-untagged id, so not every container resolves to a tag."""
-    r = subprocess.run(
-        [engine, "images", "agent", "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    tag_map: dict[str, str] = {}
-    current = f"agent:u{os.getuid()}g{os.getgid()}"
-    for line in r.stdout.splitlines():
-        iid, _, tag = line.partition("\t")
-        if not iid:
-            continue
-        # Prefer the current per-user tag when an id carries several.
-        if iid not in tag_map or tag == current:
-            tag_map[iid] = tag
-    return tag_map
-
-
-def _image_ages(engine: str) -> dict[str, int]:
-    """Short image id → local tag time (epoch seconds), from `.Metadata.LastTagTime`.
-    The nix image bakes `.Created` to the epoch (reproducible builds), so `.Created`
-    reads as "56 years ago" — useless. LastTagTime is when `agent build` tagged the
-    image on *this* host, which is the real "built …" age we want to show."""
-    r = subprocess.run(
-        [engine, "images", "agent", "--format", "{{.ID}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    ids = [x.strip() for x in r.stdout.splitlines() if x.strip()]
-    if not ids:
-        return {}
-    ri = subprocess.run(
-        [engine, "image", "inspect", "--format", "{{.Id}}\t{{.Metadata.LastTagTime}}", *ids],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    ages: dict[str, int] = {}
-    for line in ri.stdout.splitlines():
-        iid, _, ts = line.partition("\t")
-        epoch = _parse_docker_time(ts.strip())
-        if iid and epoch is not None:
-            ages[iid.removeprefix("sha256:")[:12]] = epoch
-    return ages
-
-
-_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
-
-
-def _parse_docker_time(s: str) -> int | None:
-    """Epoch seconds from a docker timestamp, tolerating both forms it renders across
-    versions/engines: ISO (`2026-07-19T03:02:54.88Z`) and Go's `time.Time` string
-    (`2026-07-19 03:02:54.88 +0000 UTC`). Sub-second and offset are dropped — age is
-    only ever shown to minute granularity, and these times are UTC in practice."""
-    m = _TIME_RE.search(s)
-    if not m:
-        return None
-    y, mo, d, h, mi, sec = (int(x) for x in m.groups())
-    try:
-        return int(datetime(y, mo, d, h, mi, sec, tzinfo=UTC).timestamp())
-    except ValueError:
-        return None
-
-
-def _rel_age(epoch: int | None) -> str:
-    """Compact relative age (`4h ago`, `3d ago`) from an epoch, or "" when unknown."""
-    if not epoch:
-        return ""
-    mins = (datetime.now(UTC).timestamp() - epoch) / 60
-    if mins < 1:
-        return "just now"
-    if mins < 60:
-        return f"{int(mins)}m ago"
-    if mins < 60 * 24:
-        return f"{int(mins / 60)}h ago"
-    days = mins / (60 * 24)
-    if days < 14:
-        return f"{int(days)}d ago"
-    if days < 60:
-        return f"{int(days / 7)}w ago"
-    return f"{int(days / 30)}mo ago"
-
-
-def _agent_volumes(engine: str) -> list[str]:
-    r = subprocess.run(
-        [engine, "volume", "ls", "--format", "{{.Name}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return [n.strip() for n in r.stdout.splitlines() if n.strip().startswith("agent-")]
-
-
-def _volume_sizes(engine: str) -> dict[str, str]:
-    """Human-readable size per agent volume, from one `system df -v` sweep (no
-    per-file `du`). Best-effort: any parse/engine hiccup yields no sizes, and the
-    roster still renders names-only."""
-    r = subprocess.run(
-        [engine, "system", "df", "-v", "--format", "{{json .Volumes}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def read_extras_state(engine: str, image: str, volume: str) -> dict[str, dict[str, Any]]:
+    r = _updater_run(engine, image, volume, f'cat "{EXTRAS_STATE_PATH}" 2>/dev/null || true')
     if r.returncode != 0 or not r.stdout.strip():
         return {}
     try:
-        rows = json.loads(r.stdout)
+        return parse_extras_state(json.loads(r.stdout))
     except json.JSONDecodeError:
+        warn("managed-extras state file is unreadable; treating it as empty and leaving installed tools alone")
         return {}
-    sizes: dict[str, str] = {}
-    for row in rows:
-        name = row.get("Name", "")
-        if name.startswith("agent-") and row.get("Size"):
-            sizes[name] = row["Size"]
-    return sizes
 
 
-def _abbrev_path(p: Path) -> str:
-    """`~`-relative, middle-elided to the last two components — enough to tell repos
-    apart without a full absolute path."""
-    try:
-        s = "~/" + str(p.relative_to(Path.home()))
-    except ValueError:
-        s = str(p)
-    parts = s.split("/")
-    if len(parts) > 3:
-        s = parts[0] + "/…/" + "/".join(parts[-2:])
-    return s
+def probe_extra_versions(engine: str, image: str, volume: str, ids: list[str]) -> dict[str, str]:
+    """Ask the installed tools themselves what version they are. Purely
+    informational: a probe that fails reports nothing rather than failing the
+    command it decorates."""
+    if not ids:
+        return {}
+    r = _updater_run(engine, image, volume, version_probe_script(ids))
+    return parse_version_report(r.stdout)
 
 
-def _container_status(c: RunContainer) -> str:
-    if not c.running:
-        return dim("stopped")
-    if c.fresh is False:
-        # Cause-agnostic on purpose: a container is stale either because its image was
-        # rebuilt (superseded) or its config changed — both mean the next call recreates.
-        return yellow("recreates next run")
-    if c.fresh is True:
-        return dim("up to date")
-    return dim("running")
-
-
-def _doctor_render(
-    checks: list[DoctorCheck],
-    containers: list[RunContainer],
-    tag_map: dict[str, str],
-    volumes: list[str],
-    vol_sizes: dict[str, str],
-    current_short: str | None,
-    ages: dict[str, int],
-) -> None:
-    # Routine state up top (one line), the inventory in the middle, and every problem
-    # collected into a single advisory section at the bottom — shown only when there
-    # is something to act on. The checks still gate the exit code upstream.
-    print()
-    _doctor_header(checks)
-    _render_tree(containers, tag_map, current_short, ages)
-    _render_volumes(volumes, vol_sizes)
-    _doctor_matrix(containers, tag_map, volumes, current_short)
-    _doctor_advisory(checks, containers, volumes, vol_sizes)
-
-
-def _doctor_header(checks: list[DoctorCheck]) -> None:
-    """The always-fine facts folded into one line — the docker engine version and the
-    shared toolchain identity. This is not a checklist: anything that needs action is
-    surfaced in the advisory section, never here."""
-    by_label = {c.label: c for c in checks}
-    parts = []
-    docker = by_label.get("docker")
-    if docker:
-        parts.append(f"docker {docker.detail}".strip())
-    tc = by_label.get("toolchain")
-    if tc:
-        if tc.status == "info":  # "not checked" — no image yet
-            parts.append(f"toolchain {tc.value}")
-        else:
-            gen = next((b for b in (tc.detail or "").split(" · ") if b.startswith("gen ")), "")
-            suffix = f" ({gen})" if gen else ""
-            parts.append(f"toolchain {tc.value.replace(' · ', ', ')}{suffix}")
-    print("  " + dim("Using " + "  ·  ".join(parts)))
-
-
-def _render_tree(containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None, ages: dict[str, int]) -> None:
-    """Group containers under the image they were built from — the derivation at a
-    glance. Containers on a rebuilt image show as an untagged id. The current image
-    is always listed (even with no containers) so a fully-drifted set is visible."""
-    print()
-    print("  " + bold("images & containers"))
-    groups: dict[str, list[RunContainer]] = {}
-    if current_short:
-        groups[current_short] = []
-    for c in containers:
-        groups.setdefault(c.image_short, []).append(c)
-    if not groups:
-        print("    " + dim("none yet"))
-        return
-    for image_short, members in groups.items():
-        # Unambiguous identity (maps straight to `docker images`): the current image by
-        # its stable tag (`agent:u501g20`); any other image a container still sits on is
-        # a superseded build, shown by a full 12-char id — never its raw nix content tag
-        # (`agent:4zccz…`), which is noise. Age is the local tag time (see `_image_ages`).
-        age = _rel_age(ages.get(image_short))
-        built = f" · built {age}" if age else ""
-        if image_short == current_short:
-            handle = tag_map.get(image_short) or image_short[:12]
-            header = cyan(handle) + dim(f"   ·  current build{built}")
-        else:
-            header = image_short[:12] + dim(f"   ·  superseded build{built}")
-        print("    " + header)
-        if not members:
-            print(f"      {dim('└─ no containers')}")
-            continue
-        for i, c in enumerate(members):
-            connector = "└─" if i == len(members) - 1 else "├─"
-            glyph = green("●") if c.running else dim("○")
-            label = _abbrev_path(c.path) if c.path else c.name
-            print(f"      {dim(connector)} {glyph} {label.ljust(32)}{_container_status(c)}")
-    if len(containers) >= RUN_PILEUP_WARN:
-        print("    " + dim(f"{len(containers)} containers — reclaim with `agent stop --all` or `agent clean`"))
-
-
-def _render_volumes(volumes: list[str], vol_sizes: dict[str, str]) -> None:
-    """Roster of this tool's volumes by their real docker name (so each row maps
-    straight to `docker volume ls`) and size, one aligned row each. Ordered by role;
-    what each command would do to them lives in the maintenance-impact matrix below,
-    so no per-row notes are repeated here."""
-    order = _volume_order(volumes)
-    rows = [(name, _fmt_size(vol_sizes.get(name))) for name in order]
-    print()
-    print("  " + bold("volumes"))
-    if not rows:
-        print("    " + dim("none"))
-        return
-    name_w = max(len(name) for name, _ in rows)
-    size_w = max((len(size) for _, size in rows), default=0)
-    for name, size in rows:
-        print("    " + name.ljust(name_w) + "  " + dim(size.rjust(size_w)))
-
-
-def _volume_order(volumes: list[str]) -> list[str]:
-    """Present agent volumes in a stable role order (home, shared store, build cache,
-    legacy cache), then any others, so the roster and the matrix line up row-for-row."""
-    store = nix_shared_volume(getpass.getuser())
-    home = next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), "")
-    preferred = [home, store, NIX_BUILD_CACHE_VOLUME, LEGACY_BUILD_CACHE_VOLUME]
-    ordered = [v for v in preferred if v in volumes]
-    ordered += [v for v in volumes if v not in ordered]
-    return ordered
-
-
-_MATRIX_COLS = ("update", "build", "clean")
-
-
-def _doctor_matrix(containers: list[RunContainer], tag_map: dict[str, str], volumes: list[str], current_short: str | None) -> None:
-    """What each maintenance command would do to every artifact, one row each. Computed
-    from the *current* state, never a guess: `agent clean` leaves images pinned by a
-    live (running) session, so an image's clean effect is read off what is running —
-    keeping the destination's promise that no shown fact is misleading. `—` = no
-    effect. Command semantics: `build` reseeds the current image; `update` writes the
-    shared store (and build cache) in place; `clean` removes stopped run containers,
-    unused images, the legacy cache, and trims the shared store."""
-    running_imgs = {c.image_short for c in containers if c.running}
-    rows: list[tuple[str, tuple[str, str, str]]] = []
-
-    if current_short:
-        label = tag_map.get(current_short) or current_short[:12]
-        rows.append((label, ("—", "rebuild", "keep" if current_short in running_imgs else "remove")))
-    seen = {current_short}
-    for c in containers:
-        if c.image_short in seen:
-            continue
-        seen.add(c.image_short)
-        rows.append((c.image_short[:12], ("—", "—", "keep" if c.image_short in running_imgs else "remove")))
-
-    store = nix_shared_volume(getpass.getuser())
-    home = next((v for v in volumes if v.startswith(HOME_VOLUME_PREFIX)), "")
-    vol_effects = {
-        home: ("—", "—", "—"),
-        store: ("write", "—", "trim"),
-        NIX_BUILD_CACHE_VOLUME: ("write", "write", "reclaim"),
-        LEGACY_BUILD_CACHE_VOLUME: ("—", "—", "remove"),
-    }
-    for name in _volume_order(volumes):
-        rows.append((name, vol_effects.get(name, ("—", "—", "—"))))
-
-    # Omit no-ops (point 5): drop any artifact every command leaves untouched (e.g.
-    # `home`), so every row shown is one a command actually acts on.
-    rows = [row for row in rows if any(e != "—" for e in row[1])]
-    if not rows:
-        return
-    print()
-    print("  " + bold("maintenance impact"))
-    label_w = max(len(label) for label, _ in rows)
-    cell_w = max(len("rebuild"), *(len(x) for x in _MATRIX_COLS)) + 2
-    print(("    " + " " * label_w + "  " + dim("".join(c.ljust(cell_w) for c in _MATRIX_COLS))).rstrip())
-    for label, effects in rows:
-        cells = "".join((dim(x) if x == "—" else x) + " " * (cell_w - len(x)) for x in effects)
-        print(("    " + label.ljust(label_w) + "  " + cells).rstrip())
-
-
-def _doctor_advisory(checks: list[DoctorCheck], containers: list[RunContainer], volumes: list[str], vol_sizes: dict[str, str]) -> None:
-    """The single bottom section — shown only when something needs attention, each item
-    in plain language with its fix. It never gates the exit code (the checks upstream
-    do); it only re-presents their advisory/fail signals plus the actionable inventory,
-    deduped so nothing appears both here and as a check row. All clear → one line."""
-    by_label = {c.label: c for c in checks}
-    items: list[tuple[list[str], str]] = []  # (paragraph lines, optional fix block)
-
-    tc = by_label.get("toolchain")
-    if tc and tc.status == "info":
-        # No image built yet — the store-touching reads were skipped, so the "not
-        # checked" facts up top are not a clean bill of health. Surface the one setup
-        # step; its presence also stops the verdict from claiming "Everything healthy".
-        items.append((["The agent image isn't built yet.", "Run `agent build` to set it up."], ""))
-
-    nofile = by_label.get("open files")
-    if nofile and nofile.status == "fail":
-        body = [f"The open-file limit is too low: {nofile.value} (want ≥524288)."]
-        body += list(nofile.why)
-        if nofile.fix:
-            body.append(f"Fix — {nofile.fix}.")
-        items.append((body, nofile.fix_block))
-
-    if tc and tc.status == "warn":
-        items.append((["A newer toolchain is available.", "Run `agent update`."], ""))
-
-    for c in containers:
-        if c.fresh is False:
-            who = _abbrev_path(c.path) if c.path else c.name
-            items.append(([f"{who} is out of date.", "It is recreated on its next `agent run`."], ""))
-
-    if LEGACY_BUILD_CACHE_VOLUME in volumes:
-        size = _fmt_size(vol_sizes.get(LEGACY_BUILD_CACHE_VOLUME), round_int=True)
-        amount = f"{size} of " if size else ""
-        items.append(([f"{amount}old build cache can be freed.", "Run `agent clean`."], ""))
-
-    print()
-    if not items:
-        print(f"  {green('✓')}  {green('Everything healthy')}")
-        return
-    print(f"  {yellow('!')} {bold('Needs attention')}")
-    for body, block in items:
-        print()
-        print(f"    {dim('•')} {body[0]}")
-        for line in body[1:]:
-            print(f"        {dim(line)}")
-        if block:
-            _doctor_block(block)
-
-
-def _doctor_json(
-    checks: list[DoctorCheck],
-    containers: list[RunContainer],
-    tag_map: dict[str, str],
-    volumes: list[str],
-    vol_sizes: dict[str, str],
-) -> None:
-    print(
-        json.dumps(
-            {
-                "checks": [
-                    {
-                        "check": c.label,
-                        "status": c.status,
-                        "value": c.value,
-                        "detail": c.detail or None,
-                        "note": c.note or None,
-                        "fix": c.fix or None,
-                    }
-                    for c in checks
-                ],
-                "containers": [
-                    {
-                        "name": c.name,
-                        "running": c.running,
-                        "image": c.image_short,
-                        "image_tag": tag_map.get(c.image_short),
-                        "path": str(c.path) if c.path else None,
-                        "up_to_date": c.fresh,
-                    }
-                    for c in containers
-                ],
-                "volumes": [{"name": v, "size": vol_sizes.get(v)} for v in volumes],
-            },
-            indent=2,
-        )
+def write_extras_state(engine: str, image: str, volume: str, state: dict[str, dict[str, Any]]) -> bool:
+    """Persist the managed-extras map atomically inside the shared home volume.
+    Returns whether the write succeeded: an unrecorded success would silently
+    diverge from reality, so the caller counts a failure here like any other."""
+    script = (
+        f'set -e\nmkdir -p "$(dirname {EXTRAS_STATE_PATH})"\n'
+        f'cat > "{EXTRAS_STATE_PATH}.tmp"\nmv "{EXTRAS_STATE_PATH}.tmp" "{EXTRAS_STATE_PATH}"\n'
     )
+    r = _updater_run(engine, image, volume, script, stdin=extras_state_json(state))
+    if r.returncode != 0:
+        warn(f"could not record managed-extras state: {r.stderr.strip() or f'exit {r.returncode}'}")
+        return False
+    return True
+
+
+_RESULT_STYLE = {
+    RESULT_INSTALLED: green,
+    RESULT_UPDATED: green,
+    RESULT_REMOVED: cyan,
+    RESULT_SKIPPED: dim,
+    RESULT_FAILED: red,
+    RESULT_UNCHANGED: dim,
+}
+
+
+def op_outcome(op: ExtraOp, ok: bool, before: dict[str, str], after: dict[str, str]) -> tuple[str, str]:
+    """The reported (result, version note) for one finished operation. An update
+    that did not move the version reads as "up to date" rather than "updated",
+    since the two are indistinguishable to the user otherwise."""
+    if not ok:
+        return RESULT_FAILED, ""
+    old, new = before.get(op.package_id, ""), after.get(op.package_id, "")
+    result = _ACTION_RESULT[op.action]
+    if op.action == ACTION_REMOVE or not new:
+        return result, ""
+    if old and old != new:
+        return result, f"{old} → {new}"
+    if op.action == ACTION_UPDATE and old == new:
+        return RESULT_UNCHANGED, new
+    return result, new
+
+
+def outcome_headline(result: str, note: str) -> str:
+    """The same outcome as one phrase, for the line the operation was announced
+    on — so a long update reads as a sentence rather than as a summary lookup."""
+    if not note:
+        return result
+    if result == RESULT_UNCHANGED:
+        return f"{note} is already the newest version"
+    return f"{result} {note}"
+
+
+def reconcile_extras(engine: str, image: str, settings: Settings) -> int:
+    """Converge the shared home volume on the selected extra packages. Every
+    package is attempted even if an earlier one failed, so one upstream outage
+    cannot block unrelated tools. Returns the number of failed operations."""
+    username = current_username()
+    volume = home_volume(username)
+    selected, unknown = normalize_extra_packages(settings.extra_packages)
+    for name in unknown:
+        warn(f"unknown extra package {name!r} in settings; ignoring")
+
+    state = read_extras_state(engine, image, volume)
+    ops, stale = plan_reconciliation(selected, list(state))
+
+    print(f"{_sty('1;35', '⬢')} {bold('extras → shared home volume')} {dim(f'({volume})')}")
+
+    # Packages the state claims but the registry no longer defines: their owned
+    # paths are unknown, so nothing is executed for them — they are reported as
+    # skipped rather than silently dropped.
+    for name in stale:
+        warn(f"managed-extras state names unknown package {name!r}; leaving its files alone")
+        print(f"  {_sty('1;34', '→')} {name}... {dim(RESULT_SKIPPED)}")
+
+    if not ops and not stale:
+        print(f"  {dim('Nothing to do.')}")
+        return 0
+
+    # Every version installed before the pass, in one container run. Afterwards
+    # only the package that just changed is re-read.
+    before = probe_extra_versions(engine, image, volume, [op.package_id for op in ops if op.action != ACTION_REMOVE])
+
+    failures = 0
+    for op in ops:
+        command = op_command(op)
+        if command is None:  # unreachable: ops only ever name registry entries
+            continue
+        entry = extra_by_id(op.package_id)
+        assert entry is not None
+        # No newline: the outcome lands on the same line, and the flush makes the
+        # announcement visible while a slow installer runs.
+        print(f"  {_sty('1;34', '→')} {op.action} {entry.label}... ", end="", flush=True)
+        r = _updater_run(engine, image, volume, command)
+        ok = r.returncode == 0
+        after = probe_extra_versions(engine, image, volume, [op.package_id] if ok and op.action != ACTION_REMOVE else [])
+        result, note = op_outcome(op, ok, before, after)
+        print(_RESULT_STYLE[result](outcome_headline(result, note)), flush=True)
+        if not ok:
+            failures += 1
+            output = (r.stdout + r.stderr).strip()
+            warn(f"{op.action} of {op.package_id} failed (exit {r.returncode})" + (f":\n{output}" if output else ""))
+        state = apply_op_result(state, op, ok)
+        if not write_extras_state(engine, image, volume, state):
+            failures += 1
+
+    return failures
+
+
+def maintain(engine: str, image: str, settings: Settings, *, always_build: bool, refresh: bool = False) -> int:
+    """The shared build-then-reconcile phase, under the per-user lock. `agent
+    build` always rebuilds; `agent update` builds only when no image exists yet,
+    so first-time setup has a single useful command. `refresh` is the explicit
+    `agent build --refresh` request and defaults off for every path that only
+    builds incidentally. Returns the failure count."""
+    with maintenance_lock(current_username()):
+        if always_build or not image_exists(engine, image):
+            build_image(engine, image, settings, refresh=refresh)
+        return reconcile_extras(engine, image, settings)
+
+
+def run_maintenance(engine: str, image: str, settings: Settings, *, always_build: bool, refresh: bool) -> None:
+    """`agent build` / `agent update` proper: a failed package operation makes the
+    whole command exit nonzero, so automation and scripts can see it."""
+    failures = maintain(engine, image, settings, always_build=always_build, refresh=refresh)
+    if failures:
+        die(f"{failures} extra package operation(s) failed; rerun `agent update` to retry")
+
+
+# --- Session containers ------------------------------------------------------
 
 
 def resolve_mount_root(settings: Settings) -> Path:
@@ -1534,55 +1841,6 @@ def resolve_repo_root(pwd: Path, home: Path) -> Path:
             break
         p = parent
     return pwd
-
-
-_DOCKER_INSTALL_HINT = "https://docs.docker.com/get-docker/"
-
-
-def check_engine(engine: str, *, quiet: bool = False) -> None:
-    """`quiet` suppresses the progress pair: `agent doctor --json` needs stdout to
-    stay clean JSON, and this runs before doctor's own as_json branch even exists."""
-    if not shutil.which(engine):
-        die(f"{engine} not in PATH\nInstall: {_DOCKER_INSTALL_HINT}")
-
-    # Runs on every invocation and is usually instant, but `engine info` can take
-    # several seconds if the daemon is still cold-starting — print before, not after.
-    if not quiet:
-        _progress(f"{_sty('1;34', '→')} Checking {engine}...")
-    info = _run_quiet([engine, "info"])
-    if info.returncode != 0:
-        stderr = info.stderr.decode(errors="replace").strip()
-        die(f"`{engine} info` failed:\n{stderr}")
-    if not quiet:
-        _progress(f"{_sty('1;32', '✓')} {engine} ready.")
-
-
-def image_exists(engine: str, image: str) -> bool:
-    return _run_quiet([engine, "image", "inspect", image]).returncode == 0
-
-
-def _volume_exists(engine: str, volume: str) -> bool:
-    return _run_quiet([engine, "volume", "inspect", volume]).returncode == 0
-
-
-def build_container_name(uid: int, gid: int) -> str:
-    return f"agent-build-u{uid}g{gid}"
-
-
-def run_container_name(mount_root: Path) -> str:
-    """Per-repo persistent container name, keyed by the mounted root."""
-    digest = hashlib.sha256(str(mount_root).encode()).hexdigest()[:12]
-    return f"{RUN_CONTAINER_PREFIX}{digest}"
-
-
-def _image_id(engine: str, image: str) -> str:
-    r = subprocess.run(
-        [engine, "image", "inspect", "--format", "{{.Id}}", image],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return r.stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -1616,15 +1874,63 @@ class RunSpec:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path) -> RunSpec:
+    """Construct the per-repo RunSpec (mounts, env, user, image id) the run path uses.
+    Read-only/observational, so `agent doctor` can call it to predict drift with no
+    side effects and its fingerprint matches the one `main` creates the container with."""
+    uid, gid = os.getuid(), os.getgid()
+    username = current_username()
+
+    mount_specs = [
+        f"{mount_root}:{mount_root}",
+        # The shared, persistent home volume. It is intentionally writable by the
+        # interactive agent user: native tools manage normal user-level state here.
+        f"{home_volume(username)}:{CONTAINER_HOME}",
+    ]
+    if Path("/etc/localtime").is_file():
+        mount_specs.append("/etc/localtime:/etc/localtime:ro")
+    # Host git puts the credential-cache socket under $XDG_CACHE_HOME (default
+    # ~/.cache); mount from there so it lines up with the daemon's actual path.
+    host_cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    cred_cache = host_cache / "git/credential"
+    if cred_cache.is_dir():
+        mount_specs.append(f"{cred_cache}:{CONTAINER_HOME}/.cache/git/credential")
+    for mount in settings.shared_host_paths:
+        host_path = Path(mount.host).expanduser()
+        if not host_path.exists():
+            continue
+        mount_specs.append(f"{host_path}:{mount.container}:ro")
+
+    # Env is fixed at container-create time (not per invocation). All entries are
+    # static KEY=value from settings; a bare pass-through name would freeze its
+    # value at create until `agent stop`.
+    env_values = list(settings.env_vars)
+
+    # SSH agent forwarding — key never enters the container.
+    # macOS + Docker Desktop: socket injected by Docker Desktop at a fixed path.
+    # Linux: forward the host socket via bind-mount.
+    if sys.platform == "darwin":
+        env_values.append("SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock")
+    else:
+        ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
+        if ssh_sock and Path(ssh_sock).is_socket():
+            mount_specs.append(f"{ssh_sock}:{ssh_sock}")
+            env_values.append(f"SSH_AUTH_SOCK={ssh_sock}")
+
+    return RunSpec(
+        name=run_container_name(username, mount_root),
+        image=image,
+        image_id=_image_id(engine, image),
+        user=f"{uid}:{gid}",
+        mounts=mount_specs,
+        env=env_values,
+    )
+
+
 def _inspect_run_container(engine: str, name: str) -> tuple[bool, str] | None:
     """Return (running, fingerprint) for the named container, or None if absent.
     One inspect yields existence, run state, and the stored fingerprint together."""
-    r = subprocess.run(
-        [engine, "inspect", "--format", '{{.State.Running}}\t{{index .Config.Labels "agent.fingerprint"}}', name],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    r = _run_text([engine, "inspect", "--format", '{{.State.Running}}\t{{index .Config.Labels "agent.fingerprint"}}', name])
     if r.returncode != 0:
         return None
     running_s, _, fp = r.stdout.strip().partition("\t")
@@ -1663,653 +1969,544 @@ def create_run_container(engine: str, spec: RunSpec) -> None:
     _progress(f"{_sty('1;32', '✓')} Session container ready.")
 
 
-def ensure_run_container(engine: str, image: str, spec: RunSpec) -> str:
-    """Create-or-reuse: one inspect drives absent/stale/stopped/running. Returns
-    the transition so the caller can (re)write the per-session gcroot only when
-    the container freshly starts on the current generation — `"fresh"` for a
-    newly created or restarted container, `"reused"` when joining one that was
-    already running (its gcroot already records its start generation)."""
+def ensure_run_container(engine: str, spec: RunSpec) -> None:
+    """Create-or-reuse: one inspect drives absent/stale/stopped/running. A running
+    container is never replaced — that would kill a live session — so a rebuild can
+    only ever take effect the next time the container is (re)created."""
     state = _inspect_run_container(engine, spec.name)
     if state is not None and state[0]:
-        if state[1] == spec.fingerprint:
-            # running + matching → nothing to do. The store doesn't need
-            # re-checking: this same container proved it seeded when it started,
-            # and nothing about a shared, already-mounted volume can go stale
-            # while it's in use.
-            return "reused"
-        # Stale config (e.g. after `agent update`), but a session is still
-        # running in it — recreating would kill that session. Join the old
-        # container instead; it picks up the new config once stopped.
-        warn(
-            f"{spec.name} config changed but a session is still running; "
-            f"joining the existing (outdated) container instead of rebuilding. "
-            f"Run `agent stop` once no session is active to pick up the new config."
-        )
-        return "reused"
-
-    # Every path below freshly (re)starts the container against the shared store,
-    # so this is the only place that needs to pay for confirming it's seeded.
-    ensure_seeded(engine, image)
+        if state[1] != spec.fingerprint:
+            warn(
+                f"{spec.name} config changed but a session is still running; "
+                f"joining the existing (outdated) container instead of recreating it. "
+                f"Run `agent stop` once no session is active to pick up the new config."
+            )
+        return
     if state is None:
         create_run_container(engine, spec)
     elif state[1] != spec.fingerprint:
-        # Stopped and stale → safe to tear down and recreate.
+        # Stopped and stale (e.g. after an image rebuild) → tear down and recreate.
         _run_quiet([engine, "rm", "-f", spec.name])
         create_run_container(engine, spec)
     else:
-        # Stopped but matching → fast restart (the point of persistence).
         _progress(f"{_sty('1;34', '→')} Restarting session container...")
         _run_quiet([engine, "start", spec.name])
         _progress(f"{_sty('1;32', '✓')} Session container ready.")
-    return "fresh"
 
 
-def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path) -> RunSpec:
-    """Construct the per-repo RunSpec (mounts, env, user, image id) the run path uses.
-    Read-only/observational — no volume creation or home migration happens here (that
-    stays in `main`) — so `agent doctor` can call it to predict drift with no side
-    effects, and its fingerprint matches the one `main` creates the container with."""
-    uid, gid = os.getuid(), os.getgid()
-    home_volume = f"{HOME_VOLUME_PREFIX}u{uid}g{gid}"
-
-    mount_specs = [
-        f"{mount_root}:{mount_root}",
-        f"{home_volume}:/home/agent",
-        # The shared, persistent /nix store, mounted read-write. The session runs
-        # as the non-root agent user against the root-owned store, so ownership —
-        # not a read-only mount — enforces "read-only consumer": binaries execute
-        # via PATH, but the session cannot mutate the toolchain (that goes through
-        # `agent update`). Folded into the fingerprint like any other mount.
-        f"{nix_shared_volume(getpass.getuser())}:/nix",
-    ]
-    if Path("/etc/localtime").is_file():
-        mount_specs.append("/etc/localtime:/etc/localtime:ro")
-    # Host git puts the credential-cache socket under $XDG_CACHE_HOME (default
-    # ~/.cache); mount from there so it lines up with the daemon's actual path.
-    host_cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    cred_cache = host_cache / "git/credential"
-    if cred_cache.is_dir():
-        mount_specs.append(f"{cred_cache}:/home/agent/.cache/git/credential")
-    for mount in settings.shared_host_paths:
-        host_path = Path(mount.host).expanduser()
-        if not host_path.exists():
-            continue
-        mount_specs.append(f"{host_path}:{mount.container}:ro")
-
-    # Env is fixed at container-create time (not per invocation). All entries are
-    # static KEY=value from settings; a bare pass-through name would freeze its
-    # value at create until `agent stop`.
-    env_values = list(settings.env_vars)
-
-    # SSH agent forwarding — key never enters the container.
-    # macOS + Docker Desktop: socket injected by Docker Desktop at a fixed path.
-    # Linux: forward the host socket via bind-mount.
-    if sys.platform == "darwin":
-        env_values.append("SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock")
-    else:
-        _ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
-        if _ssh_sock and Path(_ssh_sock).is_socket():
-            mount_specs.append(f"{_ssh_sock}:{_ssh_sock}")
-            env_values.append(f"SSH_AUTH_SOCK={_ssh_sock}")
-
-    return RunSpec(
-        name=run_container_name(mount_root),
-        image=image,
-        image_id=_image_id(engine, image),
-        user=f"{uid}:{gid}",
-        mounts=mount_specs,
-        env=env_values,
-    )
+def warn_on_apt_drift(engine: str, image: str, settings: Settings) -> None:
+    """Ordinary launches never build; they only point out that the running image
+    was made from a different package selection than settings now describe."""
+    baked = image_apt_fingerprint(engine, image)
+    wanted = apt_fingerprint(settings.apt_packages)
+    if baked is not None and baked != wanted:
+        warn(f"image {image} was built from a different Debian package selection; run `agent build` to refresh it")
 
 
-def _list_run_containers(engine: str, *, running_only: bool = False) -> list[str]:
-    """Names of persistent `agent-run-*` containers for this user. All by default;
-    `running_only` restricts to those currently up (live sessions)."""
-    cmd = [engine, "ps"] if running_only else [engine, "ps", "-a"]
-    cmd += ["--filter", f"name={RUN_CONTAINER_PREFIX}", "--format", "{{.Names}}"]
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return [n.strip() for n in r.stdout.splitlines() if n.strip()]
-
-
-def _remove_all_run_containers(engine: str, reason: str) -> list[str]:
-    """Force-remove every persistent run container for this user (killing any live
-    session). Shared by `clean --force` and `reset`; returns the names removed."""
-    names = _list_run_containers(engine)
-    if names:
-        warn(f"{reason}: {', '.join(names)}")
-        _clean_step("Removing persistent containers", [engine, "rm", "-f", *names])
-    return names
-
-
-def run_stop(engine: str, image: str, mount_root: Path, *, all_repos: bool) -> None:
-    """`agent stop`: full teardown (rm -f) to release the name and unpin the
-    image, and drop the per-session gcroot(s) so the toolchain the session pinned
-    becomes collectable. `--all` sweeps every persistent container for this user."""
+def run_stop(engine: str, mount_root: Path, *, all_repos: bool) -> None:
+    """`agent stop`: full teardown (rm -f) to release the name and unpin the image.
+    `--all` sweeps every visible persistent container, regardless of username, so a
+    shared Docker host can be cleaned up comprehensively."""
     if all_repos:
         names = _list_run_containers(engine)
         if not names:
             print(f"{_sty('2', '•')} No persistent containers to stop.")
             return
         _clean_step(f"Removing {len(names)} persistent container(s)", [engine, "rm", "-f", *names])
-    else:
-        names = [run_container_name(mount_root)]
-        _clean_step(f"Stopping {names[0]}", [engine, "rm", "-f", names[0]], missing_ok=True)
-    volume = nix_shared_volume(getpass.getuser())
-    if _volume_exists(engine, volume) and image_exists(engine, image):
-        remove_session_gcroots(engine, image, volume, names)
-
-
-def _is_container_running(engine: str, name: str) -> bool:
-    r = subprocess.run(
-        [engine, "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return any(line.strip() == name for line in r.stdout.splitlines())
-
-
-def _run_quiet(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(cmd, capture_output=True, check=False)
-
-
-def _clean_step(label: str, cmd: list[str], *, missing_ok: bool = False) -> None:
-    _progress(f"{_sty('1;34', '→')} {label}...")
-    r = _run_quiet(cmd)
-    stderr = r.stderr.decode(errors="replace").strip()
-    if r.returncode == 0:
-        print(f"{_sty('1;32', '✓')} {label}.")
         return
-    if missing_ok:
-        missing_markers = (
-            "No such image",
-            "No such object",
-            "No such volume",
-            "not found",
-        )
-        if any(marker in stderr for marker in missing_markers):
-            print(f"{_sty('2', '•')} {label}: already absent.")
-            return
-    warn(f"{label} failed: {stderr or f'exit {r.returncode}'}")
+    name = run_container_name(current_username(), mount_root)
+    _clean_step(f"Stopping {name}", [engine, "rm", "-f", name], missing_ok=True)
 
 
-def _images_in_use(engine: str) -> set[str]:
-    """Return short image ids currently in use by running containers."""
-    r = subprocess.run(
-        [engine, "ps", "-aq", "--no-trunc"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        return set()
-    container_ids = [c.strip() for c in r.stdout.splitlines() if c.strip()]
-    ri = subprocess.run(
-        [engine, "inspect", "--format", "{{.Image}}", *container_ids],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    image_ids: set[str] = set()
-    if ri.returncode == 0:
-        for raw in ri.stdout.splitlines():
-            raw = raw.strip()
-            if raw:
-                image_ids.add(raw.removeprefix("sha256:")[:12])
-    return image_ids
-
-
-def run_clean(engine: str, image: str, *, force: bool = False) -> None:
-    """Session-respecting reclaim over two stores. Gentle (default): remove only
-    *stopped* run containers (to unpin their images), leave live sessions and
-    their images untouched, and GC the shared store keeping the current
-    generation + every generation still pinned by a live session. `--force`:
-    remove *all* run containers (killing live sessions) and GC the shared store
-    down to the current generation. Both also reclaim orphaned image tarballs."""
+def run_clean(engine: str, *, force: bool = False) -> None:
+    """Reclaim stopped sessions and unused images across every visible user.
+    Persistent home volumes are never touched: they hold credentials, tool
+    installations, and caches, so deleting them is left to Docker's own explicit
+    volume commands."""
+    all_names = _list_run_containers(engine)
+    running = set(_list_run_containers(engine, running_only=True))
     if force:
-        _remove_all_run_containers(engine, "removing persistent container(s), killing any live session")
+        if all_names:
+            warn(f"removing persistent container(s), killing any live session: {', '.join(all_names)}")
+            _clean_step(f"Removing {len(all_names)} persistent container(s)", [engine, "rm", "-f", *all_names])
+        else:
+            print(f"{_sty('2', '•')} No persistent containers to remove.")
     else:
-        all_names = _list_run_containers(engine)
-        running = set(_list_run_containers(engine, running_only=True))
         stopped = [n for n in all_names if n not in running]
         if stopped:
             _clean_step(f"Removing {len(stopped)} stopped container(s)", [engine, "rm", "-f", *stopped])
         elif all_names:
             print(f"{_sty('2', '•')} Leaving {len(all_names)} live session(s) untouched (use --force to reclaim).")
-
-    volume = nix_shared_volume(getpass.getuser())
-    if _volume_exists(engine, volume) and image_exists(engine, image):
-        # Reap after the removals above, so the running set reflects reality.
-        _gc_shared_store(engine, image, volume, set(_list_run_containers(engine, running_only=True)))
+        else:
+            print(f"{_sty('2', '•')} No stopped containers to remove.")
 
     _reclaim_images(engine)
     print(f"{_sty('1;32', '✓')} Clean finished.")
 
 
-def _gc_shared_store(engine: str, image: str, volume: str, running: set[str]) -> None:
-    """Reap session roots for not-running containers, then `nix-collect-garbage`
-    the shared store keeping the current generation + every generation with
-    number >= the oldest live session's. Also reclaims the build-time deps that
-    `agent update` left in the store."""
-    gather = (
-        f"readlink {DEFAULT_PROFILE}\n"
-        "echo ---GENS---\n"
-        f"ls {PROFILES_DIR} 2>/dev/null | grep -E '^default-[0-9]+-link$' || true\n"
-        "echo ---ROOTS---\n"
-        f"for r in {SESSION_GCROOT_DIR}/{SESSION_GCROOT_PREFIX}*; do "
-        '[ -L "$r" ] || continue; echo "$(basename "$r") $(readlink "$r")"; done\n'
-    )
-    probe = _shared_root(engine, image, volume, gather)
-    if probe.returncode != 0:
-        warn(f"could not read shared store state: {probe.stderr.strip() or f'exit {probe.returncode}'}")
-        return
-    lines = probe.stdout.splitlines()
-    current = parse_generation(lines[0]) if lines else None
-    if current is None:
-        warn("could not determine current generation; skipping store GC")
-        return
-    gens_section = lines[lines.index("---GENS---") + 1 : lines.index("---ROOTS---")]
-    roots_section = lines[lines.index("---ROOTS---") + 1 :]
-    all_gens = [g_ for g_ in (parse_generation(x) for x in gens_section) if g_ is not None]
-    root_gen: dict[str, int] = {}
-    for line in roots_section:
-        name, _, target = line.partition(" ")
-        gen = parse_generation(target)
-        if name and gen is not None:
-            root_gen[name] = gen
-
-    reap = session_roots_to_reap(list(root_gen), running)
-    live_gens = [gen for name, gen in root_gen.items() if name.removeprefix(SESSION_GCROOT_PREFIX) in running]
-    del_gens = generations_to_delete(all_gens, current, live_gens)
-
-    steps = [f"rm -f {SESSION_GCROOT_DIR}/{r}" for r in reap]
-    if del_gens:
-        steps.append(f"nix-env --profile {DEFAULT_PROFILE} --delete-generations " + " ".join(str(g_) for g_ in del_gens))
-    # Always collect: reclaims trimmed generations *and* update's build-time deps.
-    steps.append("nix-collect-garbage >&2")
-    _progress(
-        f"{_sty('1;34', '→')} Collecting shared store (keeping gen {current}"
-        + (f" + live {sorted(set(live_gens))}" if live_gens else "")
-        + ")..."
-    )
-    r = _shared_root(engine, image, volume, "\n".join(steps), stream=True)
-    if r.returncode != 0:
-        warn(f"shared store GC reported an error (exit {r.returncode})")
-
-
 def _reclaim_images(engine: str) -> None:
-    """Remove not-in-use agent image tags and orphaned build-cache tarballs."""
-    in_use_ids = _images_in_use(engine)
-    _progress(f"{_sty('1;34', '→')} Inspecting agent images...")
-    r = subprocess.run(
-        [engine, "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}", "agent"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    """Remove every visible `agent:*` image no container still references."""
+    in_use = _images_in_use(engine)
+    r = _run_text([engine, "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}", IMAGE_PREFIX.rstrip(":")])
     if r.returncode != 0:
-        die(f"could not list agent images:\n{r.stderr.strip() or f'exit {r.returncode}'}")
-
-    tag_rows: list[tuple[str, str]] = []
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("\t", 1)
-        if len(parts) == 2:
-            tag_rows.append((parts[0], parts[1]))
-    skipped_tags = [tag for tag, img_id in tag_rows if img_id[:12] in in_use_ids]
-    tags = [tag for tag, img_id in tag_rows if img_id[:12] not in in_use_ids]
-    if skipped_tags:
-        print(f"{_sty('2', '•')} Skipping in-use images: {', '.join(skipped_tags)}")
+        warn(f"could not list agent images: {r.stderr.strip() or f'exit {r.returncode}'}")
+        return
+    rows = [line.split("\t", 1) for line in r.stdout.splitlines() if "\t" in line]
+    skipped = [tag for tag, iid in rows if short_id(iid) in in_use]
+    tags = [tag for tag, iid in rows if short_id(iid) not in in_use]
+    if skipped:
+        print(f"{_sty('2', '•')} Skipping in-use images: {', '.join(skipped)}")
     if tags:
-        print(f"{_sty('2', '•')} Found images: {', '.join(tags)}")
-        _clean_step("Removing agent images", [engine, "rmi", *tags], missing_ok=True)
+        _clean_step(f"Removing {len(tags)} unused agent image(s)", [engine, "rmi", *tags], missing_ok=True)
     else:
         print(f"{_sty('2', '•')} Removing agent images: nothing to do.")
 
-    # Reclaim orphaned image tarballs from the nix build cache. Each build
-    # leaves a ~3G `-agent.tar.zst` behind; only the ones the gcroots point at
-    # (the current per-uid images) are still needed. Deleting the rest via
-    # `nix-store --delete` never touches the toolchain closure, so rebuilds
-    # stay fast — unlike a blanket `nix-collect-garbage`.
-    if _volume_exists(engine, NIX_BUILD_CACHE_VOLUME):
-        reclaim = r"""
-            keep=$(for r in /nix/var/nix/gcroots/agent-image-*; do readlink "$r" 2>/dev/null; done)
-            victims=""
-            for t in /nix/store/*-agent.tar.gz /nix/store/*-agent.tar.zst; do
-              [ -e "$t" ] || continue
-              case " $keep " in *" $t "*) ;; *) victims="$victims $t" ;; esac
-            done
-            if [ -n "$victims" ]; then nix-store --delete $victims; else echo "no orphaned tarballs"; fi
-        """
-        _clean_step(
-            "Reclaiming build cache",
-            [engine, "run", "--rm", "-v", f"{NIX_BUILD_CACHE_VOLUME}:/nix", NIX_IMAGE, "sh", "-c", reclaim],
-        )
 
-    # Drop the pre-rename build cache if it's still lying around. It's a
-    # regenerable cache, so a fresh `agent build`/`update` simply repopulates the
-    # new `agent-buildcache` — no data to migrate, just orphaned disk to reclaim.
-    if _volume_exists(engine, LEGACY_BUILD_CACHE_VOLUME):
-        _clean_step(
-            f"Removing legacy build cache {LEGACY_BUILD_CACHE_VOLUME}",
-            [engine, "volume", "rm", LEGACY_BUILD_CACHE_VOLUME],
-            missing_ok=True,
-        )
+# --- Doctor ------------------------------------------------------------------
 
 
-def run_reset(engine: str, image: str) -> None:
-    """Deepest reclaim: delete the shared /nix volume and reseed from the image —
-    the scorched-earth option for structural changes or a corrupt store. Removes
-    every run container first (they mount the volume), then reseeds."""
-    _remove_all_run_containers(engine, "removing all persistent container(s) to release the volume")
-    volume = nix_shared_volume(getpass.getuser())
-    _clean_step(f"Deleting shared /nix volume {volume}", [engine, "volume", "rm", volume], missing_ok=True)
-    ensure_seeded(engine, image)
-    print(f"{_sty('1;32', '✓')} Reset finished — shared store reseeded from image.")
+@dataclass
+class DoctorCheck:
+    """One health check's result. `value` is the primary reading; `detail` is dim
+    identifying context; `note` is a dim parenthetical; `fix` is a one-line
+    remediation surfaced in `--json` and in the advisory section."""
+
+    status: str  # ok | info | warn | fail
+    label: str
+    value: str
+    detail: str = ""
+    note: str = ""
+    fix: str = ""
 
 
-# --- Shared /nix store lifecycle: orchestration (integration-verified) ---
+@dataclass
+class RunContainer:
+    """A persistent `agent-run-*` container, with just enough to place it in the
+    image→container tree and say whether the next call would recreate it."""
+
+    name: str
+    running: bool
+    image_short: str
+    path: Path | None
+    fresh: bool | None  # None when the mounted repo path couldn't be recovered
 
 
-def _shared_root(
-    engine: str,
-    image: str,
-    volume: str,
-    script: str,
-    *,
-    extra_mounts: list[str] | None = None,
-    stream: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    """Run `script` as root (`bash -c`) in a transient agent-image container with
-    the shared /nix volume mounted rw — the *single writer* of the root-owned
-    store. Uses the agent image (not nixos/nix) on purpose: mounting the shared
-    volume at /nix hides nixos/nix's own tooling, whereas the agent image
-    resolves bash/nix/nix-env through the volume's own profile. When `stream`,
-    the child's stderr flows to the terminal (long builds) while stdout is
-    captured for the caller to parse."""
-    mounts = [arg for m in (extra_mounts or []) for arg in ("-v", m)]
-    cmd = [
-        engine,
-        "run",
-        "--rm",
-        # The agent image is always already built by the time we run root work
-        # against the shared store, so never reach a registry. Guards the doctor's
-        # drift eval offline; the network `agent update` needs is inside the
-        # container (nix fetching), which `--pull` doesn't touch.
-        "--pull=never",
-        "--user",
-        "0:0",
-        "-v",
-        f"{volume}:/nix",
-        *mounts,
-        "-e",
-        # The image bakes HOME=/home/agent (owned by the agent user), but this
-        # container runs as root — nix would warn and fall back to /root from
-        # passwd. Point HOME at /root up front to match, silencing the warning.
-        "HOME=/root",
-        "-e",
-        f"NIX_CONFIG={NIX_ROOT_CONFIG}",
-        image,
-        "bash",
-        "-c",
-        script,
-    ]
-    if stream:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=False)
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _repo_mount_path(mounts_s: str) -> Path | None:
+    """The repo bind is the one mounted at the same path inside as out
+    (`{root}:{root}`). Docker Desktop may prefix the host source with `/host_mnt`,
+    so compare against that stripped too. The destination IS the repo path."""
+    for m in mounts_s.split(";"):
+        src, _, dst = m.partition("=")
+        if not (src and dst):
+            continue
+        normalized = src.removeprefix("/host_mnt")
+        if dst in (src, normalized):
+            return Path(dst)
+    return None
 
 
-def _seed_lock_path(volume: str) -> Path:
-    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-container"
-    base.mkdir(parents=True, exist_ok=True)
-    return base / f"seed-{volume}.lock"
-
-
-@contextlib.contextmanager
-def _seed_lock(volume: str) -> Iterator[None]:
-    """Host-side first-run lock so two concurrent cold starts can't both seed the
-    high-blast-radius shared volume (every repo shares this one store)."""
-    with _seed_lock_path(volume).open("w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        yield
-
-
-def _shared_volume_seeded(engine: str, volume: str) -> bool:
-    """True once the shared volume holds a seeded, operable store. Mounts at
-    /probe (not /nix) so Docker's copy-into-empty-volume can't seed it from the
-    probe image as a side effect of the check. Tests the registered Nix DB — a
-    real file — rather than the profile symlink, whose store target isn't present
-    from the probe container's view (it would read as a dangling link)."""
-    r = _run_quiet([engine, "run", "--rm", "-v", f"{volume}:/probe", NIX_IMAGE, "sh", "-c", "test -f /probe/var/nix/db/db.sqlite"])
-    return r.returncode == 0
-
-
-def ensure_seeded(engine: str, image: str) -> str:
-    """Ensure the per-user shared /nix volume exists and is seeded from the
-    image's baked /nix, serialized by a first-run flock. Builds the image first
-    if missing. Shared by `run` and `update`, so seeding lives in one place and
-    neither command has an ordering precondition. Returns the volume name."""
-    volume = nix_shared_volume(getpass.getuser())
-    if _volume_exists(engine, volume):
-        # The common warm-start case: the store already exists, but confirming
-        # it's *seeded* still spins up a throwaway container (see
-        # `_shared_volume_seeded`) — silent otherwise, on every single invocation.
-        _progress(f"{_sty('1;34', '→')} Checking shared store...")
-        if _shared_volume_seeded(engine, volume):
-            _progress(f"{_sty('1;32', '✓')} Shared store ready.")
-            return volume
-    if not image_exists(engine, image):
-        build(engine, image)
-    _run_quiet([engine, "volume", "create", volume])
-    with _seed_lock(volume):
-        if _shared_volume_seeded(engine, volume):
-            return volume  # lost the first-run race; the winner seeded it
-        _progress(f"{_sty('1;34', '→')} Seeding shared /nix store {volume} from image (one-time)...")
-        # Docker copies the image's baked /nix into the empty volume on mount.
-        r = _run_quiet([engine, "run", "--rm", "-v", f"{volume}:/nix", image, "true"])
+def _run_container_details(engine: str, settings: Settings, image: str) -> list[RunContainer]:
+    """Inspect this user's persistent containers. Freshness reuses the run path's
+    `build_run_spec` fingerprint, so `up to date`/`recreates next run` predicts the
+    next call exactly."""
+    out: list[RunContainer] = []
+    fmt = (
+        "{{.State.Running}}\t{{.Image}}\t"
+        '{{index .Config.Labels "agent.fingerprint"}}\t'
+        "{{range .Mounts}}{{.Source}}={{.Destination}};{{end}}"
+    )
+    prefix = f"{RUN_CONTAINER_PREFIX}{current_username()}-"
+    for name in _list_run_containers(engine, prefix=prefix):
+        r = _run_text([engine, "inspect", "--format", fmt, name])
         if r.returncode != 0:
-            err = r.stderr.decode(errors="replace").strip() or f"exit {r.returncode}"
-            die(f"failed to seed shared /nix volume {volume}:\n{err}")
-        if not _shared_volume_seeded(engine, volume):
-            # The copy succeeded but the store has no registered Nix DB — the
-            # image predates the persistent /nix rework. Drop the half-seeded
-            # volume so a retry after rebuilding starts clean.
-            _run_quiet([engine, "volume", "rm", volume])
-            die(
-                f"image {image} predates the persistent /nix store (no registered "
-                f"Nix DB in its baked /nix). Rebuild it with `agent build`, then retry."
+            continue
+        running_s, _, rest = r.stdout.rstrip("\n").partition("\t")
+        img, _, rest = rest.partition("\t")
+        stored_fp, _, mounts_s = rest.partition("\t")
+        path = _repo_mount_path(mounts_s)
+        fresh: bool | None = None
+        if path is not None:
+            fresh = stored_fp == build_run_spec(engine, settings, image, path).fingerprint
+        out.append(
+            RunContainer(
+                name=name,
+                running=running_s == "true",
+                image_short=short_id(img),
+                path=path,
+                fresh=fresh,
             )
-        print(f"{_sty('1;32', '✓')} Seeded {volume}.")
-    return volume
-
-
-def write_session_gcroot(engine: str, image: str, volume: str, container: str) -> None:
-    """Record, on the *host*, the generation a container started on:
-    `gcroots/session-<container>` → the current `default-N-link`. The host is the
-    only actor that sees all containers (each has its own PID namespace, so Nix's
-    runtime-root scan can't protect a sibling's in-use toolchain). One symlink
-    both pins the closure and records N (clean reads N back via readlink)."""
-    script = (
-        f"gen=$(readlink {DEFAULT_PROFILE}) && "
-        f"mkdir -p {SESSION_GCROOT_DIR} && "
-        f"ln -sfn {PROFILES_DIR}/$gen {SESSION_GCROOT_DIR}/{SESSION_GCROOT_PREFIX}{container}"
-    )
-    r = _shared_root(engine, image, volume, script)
-    if r.returncode != 0:
-        warn(f"could not write session gcroot for {container}: {r.stderr.strip() or f'exit {r.returncode}'}")
-
-
-def remove_session_gcroots(engine: str, image: str, volume: str, containers: list[str]) -> None:
-    """Remove the per-session gcroots for the given containers (on `agent stop`)."""
-    if not containers:
-        return
-    links = " ".join(f"{SESSION_GCROOT_DIR}/{SESSION_GCROOT_PREFIX}{c}" for c in containers)
-    _shared_root(engine, image, volume, f"rm -f {links}")
-
-
-def build(engine: str, image: str) -> None:
-    uid, gid = os.getuid(), os.getgid()
-    build_name = build_container_name(uid, gid)
-    if _is_container_running(engine, build_name):
-        _progress(f"{_sty('1;34', '→')} Another build is already running ({build_name}); waiting for it to finish...")
-        r = subprocess.run([engine, "wait", build_name], capture_output=True, text=True, check=False)
-        if r.returncode != 0:
-            die(f"failed to wait for concurrent build {build_name}:\n{r.stderr.strip() or f'exit {r.returncode}'}")
-        # `engine wait` prints the container's exit code(s) on stdout.
-        failed = [code for code in r.stdout.strip().splitlines() if code and code != "0"]
-        if failed:
-            die(f"concurrent build {build_name} exited with status {failed[0]!r}; rerun `agent build`")
-        # Peer's `engine load`/`engine tag` may still be in flight after the
-        # container exits; if the image isn't yet visible, ask the user to retry.
-        if not image_exists(engine, image):
-            die(f"concurrent build {build_name} finished but image {image} is not yet tagged; rerun shortly")
-        return
-    # Clear any stopped leftover (e.g. from a crash) so `--name` can claim it.
-    _run_quiet([engine, "rm", build_name])
-    _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
-
-    # `agent build` is now a *rare* seed — routine toolchain bumps reach the
-    # store through in-place `agent update`, never a re-ship — so the path is a
-    # linear build → load → tag (the old `agent:src-<hash>` marker short-circuit,
-    # which only accelerated repeated identical builds, is gone). `--out-link`
-    # registers a gcroot so the built image tarball survives `nix-collect-garbage`
-    # in the build cache; `agent clean` reads these gcroots to reclaim orphans.
-    # AGENT_UID/AGENT_GID feed the impure `.#image` (baked agent user, home chown).
-    gcroot = f"/nix/var/nix/gcroots/agent-image-u{uid}g{gid}"
-    print(f"{_sty('1;35', '⬢')} {_bold('build → image')} {dim('(seed for new sessions)')}")
-    _progress(f"  {_sty('1;34', '→')} Building image {image}  {dim('(nix .#image)')}")
-    build_proc = subprocess.Popen(
-        [
-            engine,
-            "run",
-            "--rm",
-            "--name",
-            build_name,
-            "-v",
-            f"{NIX_BUILD_CACHE_VOLUME}:/nix",
-            "-v",
-            f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z",
-            "-e",
-            f"AGENT_UID={uid}",
-            "-e",
-            f"AGENT_GID={gid}",
-            NIX_IMAGE,
-            "sh",
-            "-c",
-            "mkdir -p /nix/var/nix/gcroots && "
-            f'cat "$(nix build path:/build#image --out-link {gcroot} --print-out-paths'
-            " --impure --extra-experimental-features 'nix-command flakes')\"",
-        ],
-        stdout=subprocess.PIPE,
-    )
-    assert build_proc.stdout is not None
-    _progress(f"  {_sty('1;34', '→')} Loading into {engine}  {dim('(tarball → engine)')}")
-    load = subprocess.run(
-        [engine, "load"],
-        stdin=build_proc.stdout,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    build_proc.stdout.close()
-    build_rc = build_proc.wait()
-    if load.returncode != 0:
-        # A truncated/corrupted stream shows up here first (e.g. unpigz:
-        # "corrupted -- incomplete deflate data"). The usual cause is a bad
-        # cached tarball in the build volume, which survives a plain retry —
-        # the fix is to drop the volume and rebuild from scratch.
-        recovery = f"{engine} volume rm {NIX_BUILD_CACHE_VOLUME} && agent build"
-        die(
-            f"{engine} load failed:\n{load.stderr.strip() or f'exit {load.returncode}'}\n"
-            f"If this looks like a corrupted or truncated stream, reset the build "
-            f"cache and retry:\n  {recovery}"
         )
-    if build_rc != 0:
-        die(f"nix build failed (exit {build_rc})")
-    m = re.search(r"agent:[a-z0-9]+", load.stdout)
-    if m is None:
-        die(f"could not extract image tag from `{engine} load` output:\n{load.stdout.strip() or '(empty)'}")
-    subprocess.run([engine, "tag", m.group(0), image], check=True)
-    print(f"  {_sty('1;32', '✓')} Image {image} ready")
+    return out
 
 
-def run_update(engine: str, image: str) -> None:
-    """The whole in-place toolchain upgrade, end-to-end, with no image rebuild
-    and no container restart: seed-if-needed → bump flake.lock + commit → build
-    `.#toolchain` straight into the shared store → atomic profile swap. The swap
-    only adds a generation and deletes nothing, so it is safe while sessions are
-    live (reclamation is the separate `agent clean`)."""
-    print(f"{_sty('1;35', '⬢')} {_bold('update → shared /nix store, in place')}")
-    volume = ensure_seeded(engine, image)
+def _image_tag_map(engine: str) -> dict[str, str]:
+    """Short image id → an `agent:*` tag. A rebuilt image leaves old containers
+    pointing at a now-untagged id, so not every container resolves to a tag."""
+    r = _run_text([engine, "images", IMAGE_PREFIX.rstrip(":"), "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}"])
+    tag_map: dict[str, str] = {}
+    current = image_tag(current_username())
+    for line in r.stdout.splitlines():
+        iid, _, tag = line.partition("\t")
+        if not iid:
+            continue
+        if iid not in tag_map or tag == current:
+            tag_map[iid] = tag
+    return tag_map
 
-    _run_quiet([engine, "volume", "create", NIX_BUILD_CACHE_VOLUME])
-    _progress(f"  {_sty('1;34', '→')} Updating flake.lock  {dim('(agent-image/)')}")
-    subprocess.run(
-        [
-            engine,
-            "run",
-            "--rm",
-            "-v",
-            f"{NIX_BUILD_CACHE_VOLUME}:/nix",
-            "-v",
-            f"{SCRIPT_DIR / 'agent-image'}:/build",
-            NIX_IMAGE,
-            "sh",
-            "-c",
-            "cd /build && nix flake update --extra-experimental-features 'nix-command flakes'",
-        ],
-        check=True,
-    )
-    print(f"  {_sty('1;32', '✓')} flake.lock updated.")
-    lock_unchanged = (
-        subprocess.run(
-            ["git", "-C", str(SCRIPT_DIR), "diff", "--quiet", "HEAD", "--", "agent-image/flake.lock"],
-            check=False,
-        ).returncode
-        == 0
-    )
-    if lock_unchanged:
-        print(_sty("2", "  flake.lock unchanged — nothing to commit."))
+
+_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
+
+
+def _parse_docker_time(s: str) -> int | None:
+    """Epoch seconds from a docker timestamp, tolerating both forms it renders across
+    versions/engines: ISO (`2026-07-19T03:02:54.88Z`) and Go's `time.Time` string
+    (`2026-07-19 03:02:54.88 +0000 UTC`)."""
+    m = _TIME_RE.search(s)
+    if not m:
+        return None
+    y, mo, d, h, mi, sec = (int(x) for x in m.groups())
+    try:
+        return int(datetime(y, mo, d, h, mi, sec, tzinfo=UTC).timestamp())
+    except ValueError:
+        return None
+
+
+def _image_ages(engine: str) -> dict[str, int]:
+    """Short image id → image creation time (epoch seconds). Creation time, not
+    last-tag time: a rebuild that hits the layer cache produces the same image, so
+    this stays put and reports how old the installed packages actually are."""
+    r = _run_text([engine, "images", IMAGE_PREFIX.rstrip(":"), "--format", "{{.ID}}"])
+    ids = [x.strip() for x in r.stdout.splitlines() if x.strip()]
+    if not ids:
+        return {}
+    ri = _run_text([engine, "image", "inspect", "--format", "{{.Id}}\t{{.Created}}", *ids])
+    ages: dict[str, int] = {}
+    for line in ri.stdout.splitlines():
+        iid, _, ts = line.partition("\t")
+        epoch = _parse_docker_time(ts.strip())
+        if iid and epoch is not None:
+            ages[short_id(iid)] = epoch
+    return ages
+
+
+def _rel_age(epoch: int | None) -> str:
+    """Compact relative age (`4h ago`, `3d ago`) from an epoch, or "" when unknown."""
+    if not epoch:
+        return ""
+    mins = (datetime.now(UTC).timestamp() - epoch) / 60
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{int(mins)}m ago"
+    if mins < 60 * 24:
+        return f"{int(mins / 60)}h ago"
+    days = mins / (60 * 24)
+    if days < 14:
+        return f"{int(days)}d ago"
+    if days < 60:
+        return f"{int(days / 7)}w ago"
+    return f"{int(days / 30)}mo ago"
+
+
+_SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([A-Za-z]+)\s*$")
+
+
+def _fmt_size(size: str | None) -> str:
+    """Docker's sizes come glued (`54.36GB`); render them spaced (`54.36 GB`).
+    Anything that doesn't parse passes through untouched."""
+    if not size:
+        return ""
+    m = _SIZE_RE.match(size)
+    if not m:
+        return size
+    return f"{m.group(1)} {m.group(2)}"
+
+
+def _volume_size(engine: str, volume: str) -> str:
+    """Docker-reported size of one volume, from a single `system df -v` sweep.
+    Best-effort: any parse or engine hiccup degrades this one field to blank."""
+    r = _run_text([engine, "system", "df", "-v", "--format", "{{json .Volumes}}"])
+    if r.returncode != 0 or not r.stdout.strip():
+        return ""
+    try:
+        rows = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return ""
+    for row in rows:
+        if isinstance(row, dict) and row.get("Name") == volume:
+            return _fmt_size(row.get("Size"))
+    return ""
+
+
+def _abbrev_path(p: Path) -> str:
+    """`~`-relative, middle-elided to the last two components — enough to tell repos
+    apart without a full absolute path."""
+    try:
+        s = "~/" + str(p.relative_to(Path.home()))
+    except ValueError:
+        s = str(p)
+    parts = s.split("/")
+    if len(parts) > 3:
+        s = parts[0] + "/…/" + "/".join(parts[-2:])
+    return s
+
+
+def _container_status(c: RunContainer) -> str:
+    if not c.running:
+        return dim("stopped")
+    if c.fresh is False:
+        return yellow("recreates next run")
+    if c.fresh is True:
+        return dim("up to date")
+    return dim("running")
+
+
+def _safe_result[T](future: concurrent.futures.Future[T], default: T) -> T:
+    """Read one doctor collection future, degrading any failure to `default` so a
+    single broken probe renders as "unavailable" instead of aborting the whole
+    report. Catching `SystemExit` alongside `Exception` contains any `die()`
+    reachable from a worker; `KeyboardInterrupt` still propagates."""
+    try:
+        return future.result()
+    except (Exception, SystemExit):
+        return default
+
+
+def _check_image(engine: str, image: str, settings: Settings) -> DoctorCheck:
+    if not image_exists(engine, image):
+        return DoctorCheck("info", "image", "not built", note="run `agent build` first", fix="run `agent build`")
+    wanted = apt_fingerprint(settings.apt_packages)
+    baked = image_apt_fingerprint(engine, image)
+    if baked is None:
+        return DoctorCheck("info", "image", image, detail="apt selection unknown", fix="run `agent build`")
+    if baked != wanted:
+        return DoctorCheck(
+            "warn",
+            "image",
+            image,
+            detail=f"apt {baked} · settings {wanted}",
+            fix="the image was built from a different package selection — run `agent build`",
+        )
+    return DoctorCheck("ok", "image", image, detail=f"apt {baked}")
+
+
+def _check_home_volume(engine: str, volume: str) -> DoctorCheck:
+    if not _volume_exists(engine, volume):
+        return DoctorCheck("info", "home volume", "not created yet", note="created on first session or `agent update`")
+    size = _volume_size(engine, volume)
+    return DoctorCheck("ok", "home volume", volume, detail=size or "size unavailable")
+
+
+def _check_extras(state: dict[str, dict[str, Any]] | None, settings: Settings) -> DoctorCheck:
+    """Purely local reading of the recorded reconciliation state — no registry or
+    network is contacted, so this says what Agent *has done*, never what is new."""
+    if state is None:
+        return DoctorCheck("info", "extras", "not checked", note="no image or home volume yet")
+    selected, _ = normalize_extra_packages(settings.extra_packages)
+    ops, stale = plan_reconciliation(selected, list(state))
+    # Updates are always "available" and doctor never checks freshness, so only
+    # installs and removals count as work the local state says is outstanding.
+    pending = [op for op in ops if op.action != ACTION_UPDATE]
+    broken = sorted(k for k, v in state.items() if v.get("status") != RESULT_INSTALLED)
+    value = f"{len(state)} managed"
+    if not pending and not broken and not stale:
+        return DoctorCheck("ok", "extras", value)
+    bits = []
+    if pending:
+        bits.append(f"{len(pending)} pending")
+    if broken:
+        bits.append(f"{len(broken)} failed ({', '.join(broken)})")
+    if stale:
+        bits.append(f"{len(stale)} unknown ({', '.join(stale)})")
+    return DoctorCheck("warn", "extras", value, detail=" · ".join(bits), fix="run `agent update`")
+
+
+def run_doctor(engine: str, image: str, settings: Settings, *, as_json: bool = False) -> None:
+    """Local, read-only environment report. Every reading is collected concurrently
+    and isolated (see `_safe_result`), so a failing probe degrades that one line
+    rather than aborting the report. No package registry, APT repository, or
+    upstream installer URL is contacted. Exit 1 iff any check is `fail`."""
+    volume = home_volume(current_username())
+    img_ok = image_exists(engine, image)
+    have_volume = _volume_exists(engine, volume)
+
+    # stderr, not stdout: `--json` needs stdout to stay clean JSON.
+    _progress(f"{_sty('1;34', '→')} Checking environment...", file=sys.stderr)
+
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        f_version = ex.submit(_docker_version, engine)
+        f_image = ex.submit(_check_image, engine, image, settings)
+        f_home = ex.submit(_check_home_volume, engine, volume)
+        probe = img_ok and have_volume
+        f_state = ex.submit(read_extras_state, engine, image, volume) if probe else None
+        f_versions = ex.submit(probe_extra_versions, engine, image, volume, registry_ids()) if probe else None
+        f_containers = ex.submit(_run_container_details, engine, settings, image)
+        f_tag_map = ex.submit(_image_tag_map, engine)
+        f_image_id = ex.submit(_image_id, engine, image)
+        f_ages = ex.submit(_image_ages, engine)
+
+    state = _safe_result(f_state, {}) if f_state else None
+    if state is not None:
+        # The recorded status says what Agent did; the version says what is
+        # actually on disk right now. Both belong to the same package line.
+        versions = _safe_result(f_versions, {}) if f_versions else {}
+        state = {pkg: {**entry, "version": versions.get(pkg, "")} for pkg, entry in state.items()}
+    checks = [
+        DoctorCheck("ok", "docker", "running", detail=f"v{_safe_result(f_version, 'unknown')}"),
+        _safe_result(f_image, DoctorCheck("info", "image", "not checked")),
+        _safe_result(f_home, DoctorCheck("info", "home volume", "not checked")),
+        _check_extras(state, settings),
+    ]
+    containers = _safe_result(f_containers, [])
+    tag_map = _safe_result(f_tag_map, {})
+    current_short = short_id(_safe_result(f_image_id, "")) or None
+    ages = _safe_result(f_ages, {})
+
+    if as_json:
+        _doctor_json(checks, containers, tag_map, state)
     else:
-        subprocess.run(["git", "-C", str(SCRIPT_DIR), "add", "agent-image/flake.lock"], check=True)
-        subprocess.run(["git", "-C", str(SCRIPT_DIR), "commit", "-m", "Update flake.lock"], check=True)
-        print(f"  {_sty('1;32', '✓')} Committed.")
+        _doctor_render(checks, containers, tag_map, current_short, ages, state)
 
-    # Build `.#toolchain` (pure, no --impure) straight into the shared store and
-    # atomically repoint the default profile — the new generation is rooted just
-    # by being the profile. Build only swaps when the toolchain path actually
-    # changed, so a no-op update never piles up redundant generations.
-    _progress(f"  {_sty('1;34', '→')} Building toolchain  {dim(f'(nix .#toolchain → {volume})')}")
-    build_and_swap = (
-        "set -e\n"
-        "tc=$(nix build path:/build#toolchain --no-link --print-out-paths)\n"
-        f"cur=$(readlink -f {DEFAULT_PROFILE} 2>/dev/null || true)\n"
-        'if [ "$tc" = "$cur" ]; then\n'
-        '  echo "RESULT uptodate $tc"\n'
-        "else\n"
-        f'  nix-env --profile {DEFAULT_PROFILE} --set "$tc" >&2\n'
-        '  echo "RESULT swapped $tc"\n'
-        "fi\n"
+    if any(c.status == "fail" for c in checks):
+        sys.exit(1)
+
+
+def _doctor_render(
+    checks: list[DoctorCheck],
+    containers: list[RunContainer],
+    tag_map: dict[str, str],
+    current_short: str | None,
+    ages: dict[str, int],
+    state: dict[str, dict[str, Any]] | None,
+) -> None:
+    print()
+    print("  " + bold("environment"))
+    width = max(len(c.label) for c in checks)
+    for c in checks:
+        line = f"    {c.label.ljust(width)}  {c.value}"
+        if c.detail:
+            line += dim(f"   ·  {c.detail}")
+        if c.note:
+            line += dim(f"  ({c.note})")
+        print(line)
+
+    _render_tree(containers, tag_map, current_short, ages)
+    _render_extras(state)
+    _doctor_advisory(checks, containers)
+
+
+def _render_tree(containers: list[RunContainer], tag_map: dict[str, str], current_short: str | None, ages: dict[str, int]) -> None:
+    """Group containers under the image they were built from. Containers on a
+    rebuilt image show as an untagged id — those recreate on their next launch."""
+    print()
+    print("  " + bold("images & containers"))
+    groups: dict[str, list[RunContainer]] = {}
+    if current_short:
+        groups[current_short] = []
+    for c in containers:
+        groups.setdefault(c.image_short, []).append(c)
+    if not groups:
+        print("    " + dim("none yet"))
+        return
+    for image_short, members in groups.items():
+        age = _rel_age(ages.get(image_short))
+        built = f" · built {age}" if age else ""
+        if image_short == current_short:
+            handle = tag_map.get(image_short) or image_short[:12]
+            header = cyan(handle) + dim(f"   ·  current build{built}")
+        else:
+            header = image_short[:12] + dim(f"   ·  superseded build{built}")
+        print("    " + header)
+        if not members:
+            print(f"      {dim('└─ no containers')}")
+            continue
+        for i, c in enumerate(members):
+            connector = "└─" if i == len(members) - 1 else "├─"
+            glyph = green("●") if c.running else dim("○")
+            label = _abbrev_path(c.path) if c.path else c.name
+            print(f"      {dim(connector)} {glyph} {label.ljust(32)}{_container_status(c)}")
+    if len(containers) >= RUN_PILEUP_WARN:
+        print("    " + dim(f"{len(containers)} containers — reclaim with `agent stop --all` or `agent clean`"))
+
+
+def _render_extras(state: dict[str, dict[str, Any]] | None) -> None:
+    print()
+    print("  " + bold("managed extras"))
+    if state is None:
+        print("    " + dim("not checked"))
+        return
+    if not state:
+        print("    " + dim("none recorded"))
+        return
+    width = max(len(k) for k in state)
+    status_width = max(len(str(v.get("status", RESULT_INSTALLED))) for v in state.values())
+    for pkg in sorted(state):
+        status = str(state[pkg].get("status", RESULT_INSTALLED))
+        version = str(state[pkg].get("version", ""))
+        style = green if status == RESULT_INSTALLED else yellow
+        print(f"    {pkg.ljust(width)}  {style(status.ljust(status_width))}" + (f"  {dim(version)}" if version else ""))
+
+
+def _doctor_advisory(checks: list[DoctorCheck], containers: list[RunContainer]) -> None:
+    """The single bottom section — shown only when something needs attention, each
+    item in plain language with its fix. All clear → one line."""
+    items: list[str] = [f"{c.value} — {c.fix}." for c in checks if c.status in ("warn", "fail") and c.fix]
+    items += [
+        f"{_abbrev_path(c.path) if c.path else c.name} is out of date; it is recreated on its next launch."
+        for c in containers
+        if c.fresh is False
+    ]
+    if any(c.label == "image" and c.status == "info" for c in checks):
+        items.insert(0, "The agent image isn't built yet. Run `agent build` to set it up.")
+
+    print()
+    if not items:
+        print(f"  {green('✓')}  {green('Everything healthy')}")
+        return
+    print(f"  {yellow('!')} {bold('Needs attention')}")
+    for item in items:
+        print(f"    {dim('•')} {item}")
+
+
+def _doctor_json(
+    checks: list[DoctorCheck],
+    containers: list[RunContainer],
+    tag_map: dict[str, str],
+    state: dict[str, dict[str, Any]] | None,
+) -> None:
+    print(
+        json.dumps(
+            {
+                "checks": [
+                    {
+                        "check": c.label,
+                        "status": c.status,
+                        "value": c.value,
+                        "detail": c.detail or None,
+                        "note": c.note or None,
+                        "fix": c.fix or None,
+                    }
+                    for c in checks
+                ],
+                "containers": [
+                    {
+                        "name": c.name,
+                        "running": c.running,
+                        "image": c.image_short,
+                        "image_tag": tag_map.get(c.image_short),
+                        "path": str(c.path) if c.path else None,
+                        "up_to_date": c.fresh,
+                    }
+                    for c in containers
+                ],
+                "extras": state,
+            },
+            indent=2,
+        )
     )
-    r = _shared_root(
-        engine,
-        image,
-        volume,
-        build_and_swap,
-        extra_mounts=[f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z"],
-        stream=True,
-    )
-    if r.returncode != 0:
-        die(f"toolchain build/swap failed (exit {r.returncode})")
-    result = re.search(r"^RESULT (uptodate|swapped) (\S+)", r.stdout, re.M)
-    if result is None:
-        die(f"could not parse update result:\n{r.stdout.strip() or '(empty)'}")
-    if result.group(1) == "uptodate":
-        print(f"  {_sty('1;32', '✓')} Toolchain current — no change  {dim('(live sessions unaffected)')}")
-    else:
-        print(f"  {_sty('1;32', '✓')} Swapped profile → {result.group(2)}  {dim('(live sessions unaffected)')}")
+
+
+# --- Entry point -------------------------------------------------------------
 
 
 def parse_args(argv: list[str]) -> tuple[str, list[str], dict[str, Any]]:
@@ -2360,9 +2557,7 @@ def main() -> None:
             die(f"invalid --mount-mode {overrides['mount_mode']!r}: must be pwd or repo_root")
         settings = replace(settings, mount_mode=overrides["mount_mode"])
     engine = ENGINE
-
-    # Image is UID-keyed because the agent user inside it is baked at build time.
-    image = os.environ.get("AGENT_IMAGE", f"agent:u{os.getuid()}g{os.getgid()}")
+    image = os.environ.get("AGENT_IMAGE", image_tag(current_username()))
 
     as_json = cmd == "doctor" and "--json" in extra
     check_engine(engine, quiet=as_json)
@@ -2372,107 +2567,36 @@ def main() -> None:
         return
 
     if cmd == "clean":
-        run_clean(engine, image, force="--force" in extra)
-        return
-
-    if cmd == "reset":
-        run_reset(engine, image)
+        run_clean(engine, force="--force" in extra)
         return
 
     if cmd == "stop":
-        run_stop(engine, image, resolve_mount_root(settings), all_repos="--all" in extra)
+        run_stop(engine, resolve_mount_root(settings), all_repos="--all" in extra)
         return
 
-    if cmd == "update":
-        run_update(engine, image)
-        return
-
-    if cmd == "check":
-        _progress(f"{_sty('1;34', '→')} Checking flake...")
-        subprocess.run(
-            [
-                engine,
-                "run",
-                "--rm",
-                "-v",
-                f"{SCRIPT_DIR / 'agent-image'}:/build:ro,z",
-                NIX_IMAGE,
-                "nix",
-                "flake",
-                "check",
-                "path:/build",
-                "--impure",
-                "--extra-experimental-features",
-                "nix-command flakes",
-            ],
-            stdout=subprocess.DEVNULL,
-            check=True,
-        )
-        return
-
-    if cmd == "build":
-        build(engine, image)
+    if cmd in ("build", "update"):
+        # `--refresh` belongs to `build` alone: the build `update` may do is an
+        # incidental first-time one, never a deliberate reinstall.
+        build = cmd == "build"
+        run_maintenance(engine, image, settings, always_build=build, refresh=build and "--refresh" in extra)
         return
 
     if not image_exists(engine, image):
-        build(engine, image)
+        # First run on this machine: bootstrap the image and its extras. A failed
+        # installer is reported but does not abort the launch — the point of this
+        # invocation is to get the user a session, not to gate on one flaky tool.
+        failures = maintain(engine, image, settings, always_build=True)
+        if failures:
+            warn(f"{failures} extra package operation(s) failed; rerun `agent update` to retry")
+    else:
+        # Ordinary launches never build and never reconcile extras; they only
+        # point out that a rebuild is due, and keep going.
+        warn_on_apt_drift(engine, image, settings)
 
     cwd = Path.cwd().resolve()
     mount_root = resolve_mount_root(settings)
-
-    uid, gid = os.getuid(), os.getgid()
-    # The shared /nix store is mounted read-write at /nix (folded into the run
-    # spec's mounts), seeded from the image's baked /nix on first ever use. The
-    # name is deterministic (no docker call needed to know it); `ensure_run_container`
-    # is the one that pays for actually confirming/seeding it, and only when a
-    # container is about to freshly mount it. `agent update` upgrades this store
-    # in place — no rebuild.
-    volume = nix_shared_volume(getpass.getuser())
-    # The home volume is still separate: Docker seeds it from image content
-    # on first creation. Home on a named volume (not a bind mount) keeps all
-    # of ~/.elan, ~/.cache, ~/.local etc on native container fs, avoiding
-    # FUSE/VirtioFS open-file limits (~14K cap vs ~25K+ for Lean builds).
-    home_volume = f"{HOME_VOLUME_PREFIX}u{uid}g{gid}"
-
-    xdg_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
-    old_home = xdg_data / "agent-container" / "home"
-    volume_missing = _run_quiet([engine, "volume", "inspect", home_volume]).returncode != 0
-    if old_home.is_dir() and volume_missing:
-        _progress(f"{_sty('1;34', '→')} Migrating old home directory into {home_volume}...")
-        _run_quiet([engine, "volume", "create", home_volume])
-        r = subprocess.run(
-            [
-                engine,
-                "run",
-                "--rm",
-                "-v",
-                f"{old_home}:/mnt/old-home:ro",
-                "-v",
-                f"{home_volume}:/home/agent",
-                "--entrypoint",
-                "sh",
-                image,
-                "-c",
-                "cp -a /mnt/old-home/. /home/agent/",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if r.returncode != 0:
-            warn(f"migration failed: {r.stderr.strip() or f'exit {r.returncode}'}")
-        else:
-            print(f"{_sty('1;32', '✓')} Migrated. Old directory preserved at {old_home}")
-
-    # Create-or-reuse the per-repo persistent container, then exec into it.
     spec = build_run_spec(engine, settings, image, mount_root)
-    state = ensure_run_container(engine, image, spec)
-    # When the container freshly (re)starts, its new processes resolve the
-    # current generation — record it as a host-written gcroot so a concurrent
-    # `agent update`/`agent clean` in another repo can't collect the toolchain
-    # this session is using. A reused-running container keeps its start-gen root.
-    if state == "fresh":
-        write_session_gcroot(engine, image, volume, spec.name)
+    ensure_run_container(engine, spec)
 
     # Only -w varies per call (cwd within the fixed mount_root); -t only with a
     # real TTY so piped/CI stdin isn't forced interactive.
@@ -2484,13 +2608,12 @@ def main() -> None:
         exec_cmd += ["bash", *extra]
         _progress(f"{_sty('1;34', '→')} Starting shell...")
     else:
-        agent = _agent_by_id(settings.coding_agent)
-        exec_cmd += [agent.id, *agent.args, *extra]
-        # `execvp` replaces this process, so nothing printed after this point is
-        # ever seen — the gap between here and the agent's own UI appearing (its
-        # startup: auth check, update check, etc) is outside this script's
-        # control, but at least the wait is now announced instead of silent.
-        _progress(f"{_sty('1;34', '→')} Starting {agent.label}...")
+        # No pre-flight check that the executable exists: if the backing extra
+        # package isn't installed, the launch fails naturally rather than Agent
+        # silently altering the user's package selection.
+        launch = _launch_agent(settings.coding_agent)
+        exec_cmd += [launch.executable, *launch.args, *extra]
+        _progress(f"{_sty('1;34', '→')} Starting {launch.label}...")
 
     os.execvp(engine, exec_cmd)
 
