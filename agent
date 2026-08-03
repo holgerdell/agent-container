@@ -15,7 +15,7 @@ import sys
 import tempfile
 import termios
 import tty
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1636,6 +1636,131 @@ def build_image(engine: str, image: str, settings: Settings, *, refresh: bool) -
 
 # --- Extra-package reconciliation: orchestration ------------------------------
 
+# Every planned operation used to run in its own transient container: one to run
+# the routine, one to probe its version, one to persist state. `build_reconcile_script`
+# folds a whole run's operations into a single script so one container does the
+# work, tagging each piece of output so `stream_reconcile_script` can report each
+# operation as soon as its result is known — progress still prints live, one
+# operation at a time, even though it's all one container. Only the state read
+# (needed to plan the operations) and the state write (needed after they're
+# known) stay as separate container calls.
+_OP_MARK = "@@AGENT-OP@@"
+_VER_MARK = "@@AGENT-VER@@"
+
+
+def build_reconcile_script(ops: list[ExtraOp], registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> str:
+    """One script covering every planned operation: a before-snapshot of every
+    affected package's version taken together (one pass, like the old
+    `version_probe_script`), then each operation in registry order, each
+    followed by an after-snapshot of just that package (skipped on failure or
+    removal). `set +e` so one operation's failure never stops the ones after
+    it — exactly as when each ran in its own container."""
+    before_entries = [e for op in ops if op.action != ACTION_REMOVE and (e := extra_by_id(op.package_id, registry)) and e.executables]
+    lines = ["set +e", _version_snapshot_block(before_entries, "before")]
+    for op in ops:
+        command = op_command(op, registry)
+        entry = extra_by_id(op.package_id, registry)
+        assert command is not None and entry is not None
+        lines.append(f"# op: {op.package_id} {op.action}")
+        lines.append(f"__out=$( {{\n{command}\n}} 2>&1 )")
+        lines.append("__rc=$?")
+        lines.append(f'printf \'{_OP_MARK}\\t%s\\t%s\\t%s\\n\' "{op.package_id}" "{op.action}" "$__rc"')
+        lines.append("printf '%s\\n' \"$__out\"")
+        if op.action != ACTION_REMOVE and entry.executables:
+            lines.append(f'if [ "$__rc" -eq 0 ]; then\n{_version_snapshot_block([entry], "after")}fi')
+    return "\n".join(lines) + "\n"
+
+
+def _version_snapshot_block(entries: list[ExtraPackage], tag: str) -> str:
+    """A version report for every one of `entries`, in a single pass, tagged
+    `before` or `after` so `stream_reconcile_script` can tell the two apart. A
+    tool that is missing or whose `--version` fails simply reports nothing."""
+    specs = " ".join(f'"{e.id}:{e.executables[0]}"' for e in entries)
+    if not specs:
+        return ""
+    return (
+        f"for spec in {specs}; do\n"
+        '  id="${spec%%:*}"; exe="${spec#*:}"; out=""\n'
+        '  command -v "$exe" >/dev/null 2>&1 && out=$("$exe" --version 2>&1 | tr "\\n" " ")\n'
+        f'  printf \'{_VER_MARK}\\t{tag}\\t%s\\t%s\\n\' "$id" "$out"\n'
+        "done\n"
+    )
+
+
+OnOp = Callable[[str, str, int, str, dict[str, str], dict[str, str]], None]
+
+
+def stream_reconcile_script(engine: str, image: str, volume: str, script: str, on_op: OnOp) -> tuple[int, str]:
+    """Run the combined reconcile script, calling `on_op(package_id, action, rc,
+    output, before, after)` as soon as each operation's result is known — the
+    tagged lines `build_reconcile_script` emits arrive one operation at a time,
+    so results are reported live instead of only after the whole container
+    exits. `before`/`after` are the version-snapshot maps, filled in as their
+    lines arrive (the before-snapshot always completes before the first
+    operation runs). Returns (container exit status, full combined stdout) —
+    the caller still needs these to notice operations that never reported at
+    all (e.g. the container failed to start)."""
+    uid, gid = os.getuid(), os.getgid()
+    proc = subprocess.Popen(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--interactive",
+            "--pull=never",
+            "--user",
+            f"{uid}:{gid}",
+            "-v",
+            f"{volume}:{CONTAINER_HOME}",
+            "-e",
+            f"HOME={CONTAINER_HOME}",
+            image,
+            "bash",
+            "-lc",
+            script,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    before: dict[str, str] = {}
+    after: dict[str, str] = {}
+    all_lines: list[str] = []
+    pending: tuple[str, str, int] | None = None
+    output_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal pending, output_lines
+        if pending is not None:
+            pkg, action, rc = pending
+            on_op(pkg, action, rc, "\n".join(output_lines).strip(), before, after)
+        pending = None
+        output_lines = []
+
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip("\n")
+        all_lines.append(line)
+        if line.startswith(_VER_MARK + "\t"):
+            _, tag, pkg, raw = line.split("\t", 3)
+            match = _VERSION_RE.search(raw)
+            if match:
+                (before if tag == "before" else after)[pkg] = match.group(0)
+            if tag == "after":
+                flush()
+        elif line.startswith(_OP_MARK + "\t"):
+            flush()
+            _, pkg, action, rc = line.split("\t", 3)
+            pending = (pkg, action, int(rc))
+        elif pending is not None:
+            output_lines.append(line)
+    flush()
+    proc.wait()
+    return proc.returncode, "\n".join(all_lines)
+
 
 def _updater_run(engine: str, image: str, volume: str, script: str, *, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run one command in a transient container as the normal Agent user, with
@@ -1763,32 +1888,43 @@ def reconcile_extras(engine: str, image: str, settings: Settings) -> int:
         print(f"  {dim('Nothing to do.')}")
         return 0
 
-    # Every version installed before the pass, in one container run. Afterwards
-    # only the package that just changed is re-read.
-    before = probe_extra_versions(engine, image, volume, [op.package_id for op in ops if op.action != ACTION_REMOVE])
-
+    # Every operation runs in one shared container instead of one each, but
+    # still reports as it goes — see `build_reconcile_script` and
+    # `stream_reconcile_script`.
     failures = 0
+    reported: set[str] = set()
+
+    def on_op(pkg: str, action: str, rc: int, output: str, before: dict[str, str], after: dict[str, str]) -> None:
+        nonlocal failures, state
+        op = ExtraOp(pkg, action)
+        entry = extra_by_id(pkg)
+        assert entry is not None
+        ok = rc == 0
+        result, note = op_outcome(op, ok, before, after)
+        print(f"  {_sty('1;34', '→')} {action} {entry.label}... " + _RESULT_STYLE[result](outcome_headline(result, note)), flush=True)
+        if not ok:
+            failures += 1
+            warn(f"{action} of {pkg} failed (exit {rc})" + (f":\n{output}" if output else ""))
+        state = apply_op_result(state, op, ok)
+        reported.add(pkg)
+
+    returncode, stdout = stream_reconcile_script(engine, image, volume, build_reconcile_script(ops), on_op)
+
+    # An operation whose result never arrived (the container itself failed to
+    # run the script at all) is not silently dropped — it's counted and
+    # recorded exactly like any other failure.
     for op in ops:
-        command = op_command(op)
-        if command is None:  # unreachable: ops only ever name registry entries
+        if op.package_id in reported:
             continue
         entry = extra_by_id(op.package_id)
         assert entry is not None
-        # No newline: the outcome lands on the same line, and the flush makes the
-        # announcement visible while a slow installer runs.
-        print(f"  {_sty('1;34', '→')} {op.action} {entry.label}... ", end="", flush=True)
-        r = _updater_run(engine, image, volume, command)
-        ok = r.returncode == 0
-        after = probe_extra_versions(engine, image, volume, [op.package_id] if ok and op.action != ACTION_REMOVE else [])
-        result, note = op_outcome(op, ok, before, after)
-        print(_RESULT_STYLE[result](outcome_headline(result, note)), flush=True)
-        if not ok:
-            failures += 1
-            output = (r.stdout + r.stderr).strip()
-            warn(f"{op.action} of {op.package_id} failed (exit {r.returncode})" + (f":\n{output}" if output else ""))
-        state = apply_op_result(state, op, ok)
-        if not write_extras_state(engine, image, volume, state):
-            failures += 1
+        failures += 1
+        print(f"  {_sty('1;34', '→')} {op.action} {entry.label}... " + _RESULT_STYLE[RESULT_FAILED](RESULT_FAILED), flush=True)
+        warn(f"{op.action} of {op.package_id} failed (exit {returncode})" + (f":\n{stdout}" if stdout else ""))
+        state = apply_op_result(state, op, False)
+
+    if not write_extras_state(engine, image, volume, state):
+        failures += 1
 
     return failures
 

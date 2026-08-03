@@ -189,8 +189,8 @@ class TestUpdate:
         env.write_state(state)
         env.write_settings(extra_packages=[])
         r = env.run("update")
-        deletions = [s for s in r.scripts() if "rm -rf" in s]
-        assert deletions == ['rm -rf "$HOME/.bun"\n']
+        deletions = [line for s in r.scripts() for line in s.splitlines() if "rm -rf" in line]
+        assert deletions == ['rm -rf "$HOME/.bun"']
 
     def test_untracked_tools_are_never_removed(self, env):
         # Nothing recorded as managed and nothing selected → no removal at all.
@@ -234,11 +234,9 @@ class TestUpdate:
         env.write_state(built(env))
         env.write_settings(extra_packages=["typst", "uv", "ruff"])
         r = env.run("update")
-        order = [i for i in ["uv", "ruff", "typst"] if any(i in s for s in r.scripts())]
-        installs = [s for s in r.scripts() if "state/agent-container" not in s and not _is_version_probe(s)]
-        positions = [next(i for i, s in enumerate(installs) if pkg in s) for pkg in order]
+        (script,) = [s for s in r.scripts() if "# op: " in s]
+        positions = [script.index(f"# op: {pkg} ") for pkg in ["uv", "ruff", "typst"]]
         assert positions == sorted(positions)
-        assert order == ["uv", "ruff", "typst"]
 
     def test_one_failure_does_not_prevent_later_packages(self, env):
         state = built(env)

@@ -34,6 +34,8 @@ STATE_PATH = Path(os.environ["FAKE_DOCKER_STATE"])
 LOG_PATH = Path(os.environ["FAKE_DOCKER_LOG"])
 EXTRAS_STATE_PATH = "/home/agent/.local/state/agent-container/extras.json"
 VERSION_PROBE_MARKER = "# agent: report extra-package versions"
+OP_MARK = "@@AGENT-OP@@"
+VER_MARK = "@@AGENT-VER@@"
 
 
 def load() -> dict:
@@ -227,10 +229,50 @@ def cmd_run(state: dict, argv: list[str]) -> int:
             state["versions"] = reports[1:]
         return 0
 
+    if OP_MARK in script:
+        return cmd_reconcile(state, script)
+
     for needle in state.get("fail", {}).get("scripts", []):
         if needle in script:
             print(f"fake installer failure: {needle}", file=sys.stderr)
             return 1
+    return 0
+
+
+def _next_report(state: dict) -> dict:
+    reports = state.get("versions") or [{}]
+    if len(reports) > 1:
+        state["versions"] = reports[1:]
+    return reports[0]
+
+
+def cmd_reconcile(state: dict, script: str) -> int:
+    """Simulate `build_reconcile_script`: one container run covering every
+    planned operation. Parses the generated script back into its before-probe
+    ids and per-operation chunks — the same shape `agent.py` built it in — and
+    fabricates the tagged output a real container would have printed. Always
+    exits 0: a real combined script never fails as a whole, since each
+    operation's own failure is captured into its own `@@AGENT-OP@@` line, not
+    the container's exit status."""
+    before_part, _, rest = script.partition("# op:")
+    if "for spec in" in before_part:
+        for pkg, raw in _next_report(state).items():
+            if f'"{pkg}:' in before_part:
+                print(f"{VER_MARK}\tbefore\t{pkg}\t{raw}")
+
+    for chunk in re.split(r"(?=^# op: )", "# op:" + rest, flags=re.M):
+        header = re.match(r"# op: (\S+) (\S+)", chunk)
+        if not header:
+            continue
+        pkg, action = header.group(1), header.group(2)
+        failing = next((n for n in state.get("fail", {}).get("scripts", []) if n in chunk), None)
+        op_rc = 1 if failing else 0
+        print(f"{OP_MARK}\t{pkg}\t{action}\t{op_rc}")
+        if failing:
+            print(f"fake installer failure: {failing}")
+        if op_rc == 0 and action != "remove" and f"{VER_MARK}\\tafter" in chunk:
+            for pkg2, raw in _next_report(state).items():
+                print(f"{VER_MARK}\tafter\t{pkg2}\t{raw}")
     return 0
 
 
