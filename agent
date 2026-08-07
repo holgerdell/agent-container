@@ -201,6 +201,8 @@ APT_GROUPS: tuple[AptGroup, ...] = (
             "texlive-fonts-extra",
             "texlive-fonts-recommended",
             "texlive-lang-english",
+            "texlive-lang-european",
+            "texlive-lang-german",
             "texlive-latex-base",
             "texlive-latex-extra",
             "texlive-latex-recommended",
