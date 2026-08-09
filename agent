@@ -54,6 +54,10 @@ SHARED_HOST_PATHS_ALLOWLIST: list[tuple[str, str, str]] = [
     ("~/.claude/agents/", "/home/agent/.claude/agents/", "custom subagents"),
     ("~/.claude/commands/", "/home/agent/.claude/commands/", "custom slash commands"),
     ("~/.agents/", "/home/agent/.agents/", "shared agent data"),
+    ("~/.codex/AGENTS.md", "/home/agent/.codex/AGENTS.md", "global Codex instructions"),
+    ("~/.config/opencode/AGENTS.md", "/home/agent/.config/opencode/AGENTS.md", "global opencode instructions"),
+    ("~/.vibe/AGENTS.md", "/home/agent/.vibe/AGENTS.md", "global vibe instructions"),
+    ("~/.gemini/GEMINI.md", "/home/agent/.gemini/GEMINI.md", "global Antigravity instructions"),
     ("~/.gitconfig", "/home/agent/.gitconfig", "git user config"),
     ("~/.config/git/", "/home/agent/.config/git/", "git XDG config"),
 ]
