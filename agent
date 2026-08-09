@@ -1733,8 +1733,8 @@ def build_image(engine: str, image: str, settings: Settings, *, refresh: bool) -
 # the routine, one to probe its version, one to persist state. `build_reconcile_script`
 # folds a whole run's operations into a single script so one container does the
 # work, tagging each piece of output so `stream_reconcile_script` can report each
-# operation as soon as its result is known — progress still prints live, one
-# operation at a time, even though it's all one container. Only the state read
+# operation as soon as its result is known — progress still prints live, as each
+# operation finishes, even though it's all one container. Only the state read
 # (needed to plan the operations) and the state write (needed after they're
 # known) stay as separate container calls.
 _OP_MARK = "@@AGENT-OP@@"
@@ -1744,23 +1744,41 @@ _VER_MARK = "@@AGENT-VER@@"
 def build_reconcile_script(ops: list[ExtraOp], registry: tuple[ExtraPackage, ...] = EXTRA_REGISTRY) -> str:
     """One script covering every planned operation: a before-snapshot of every
     affected package's version taken together (one pass, like the old
-    `version_probe_script`), then each operation in registry order, each
-    followed by an after-snapshot of just that package (skipped on failure or
-    removal). `set +e` so one operation's failure never stops the ones after
-    it — exactly as when each ran in its own container."""
+    `version_probe_script`), then every operation's own install/update routine —
+    almost entirely network calls — kicked off together in the background so
+    they run concurrently instead of one download waiting on the last. `uv` is
+    the one exception: `typos` and `mistral-vibe` shell out to it, so its
+    operation is awaited on its own before anything else starts.
+
+    Each operation still reports as a single tagged block (its result, captured
+    output, and — on success — an after-snapshot of just that package), just
+    like when it ran on its own; a `flock` around the print keeps two operations
+    that finish at the same instant from interleaving mid-line. `set +e` so one
+    operation's failure never stops the ones after it — exactly as when each ran
+    in its own container."""
     before_entries = [e for op in ops if op.action != ACTION_REMOVE and (e := extra_by_id(op.package_id, registry)) and e.executables]
-    lines = ["set +e", _version_snapshot_block(before_entries, "before")]
+    lines = ["set +e", _version_snapshot_block(before_entries, "before"), '__lock=$(mktemp)', "__pids=()"]
     for op in ops:
         command = op_command(op, registry)
         entry = extra_by_id(op.package_id, registry)
         assert command is not None and entry is not None
         lines.append(f"# op: {op.package_id} {op.action}")
-        lines.append(f"__out=$( {{\n{command}\n}} 2>&1 )")
-        lines.append("__rc=$?")
-        lines.append(f'printf \'{_OP_MARK}\\t%s\\t%s\\t%s\\n\' "{op.package_id}" "{op.action}" "$__rc"')
-        lines.append("printf '%s\\n' \"$__out\"")
-        if op.action != ACTION_REMOVE and entry.executables:
-            lines.append(f'if [ "$__rc" -eq 0 ]; then\n{_version_snapshot_block([entry], "after")}fi')
+        after_block = _version_snapshot_block([entry], "after") if op.action != ACTION_REMOVE and entry.executables else ""
+        job = (
+            f"__out=$( {{\n{command}\n}} 2>&1 )\n"
+            "__rc=$?\n"
+            f'printf \'{_OP_MARK}\\t%s\\t%s\\t%s\\n\' "{op.package_id}" "{op.action}" "$__rc"\n'
+            "printf '%s\\n' \"$__out\"\n"
+        )
+        if after_block:
+            job += f'if [ "$__rc" -eq 0 ]; then\n{after_block}fi\n'
+        lines.append(f"(\n__blk=$( {{\n{job}}} )\n{{ flock -x 9; printf '%s\\n' \"$__blk\"; }} 9>\"$__lock\"\n) &")
+        lines.append('__pids+=("$!")')
+        if op.package_id == "uv":
+            lines.append('wait "${__pids[@]}"')
+            lines.append("__pids=()")
+    lines.append('wait "${__pids[@]}"')
+    lines.append('rm -f "$__lock"')
     return "\n".join(lines) + "\n"
 
 
