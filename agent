@@ -76,10 +76,12 @@ class AptGroup:
     label: str
     description: str
     packages: tuple[str, ...]
+    default_on: bool = True
 
 
 # The built-in APT catalog. Order here is the order `agent setup` shows, and the
-# union of all groups is the default selection for a fresh settings file.
+# union of groups with default_on=True is the default selection for a fresh
+# settings file.
 APT_GROUPS: tuple[AptGroup, ...] = (
     AptGroup(
         "core",
@@ -231,6 +233,7 @@ APT_GROUPS: tuple[AptGroup, ...] = (
             "texlive-science",
             "texlive-xetex",
         ),
+        default_on=False,
     ),
 )
 
@@ -245,8 +248,8 @@ def catalog_packages(groups: tuple[AptGroup, ...] = APT_GROUPS) -> set[str]:
 
 
 def default_apt_packages(groups: tuple[AptGroup, ...] = APT_GROUPS) -> list[str]:
-    """The initial APT selection: everything in the catalog."""
-    return normalize_apt_packages(catalog_packages(groups))
+    """The initial APT selection: every package in groups that default on."""
+    return normalize_apt_packages({p for g in groups if g.default_on for p in g.packages})
 
 
 def normalize_apt_packages(names: object) -> list[str]:
@@ -343,9 +346,17 @@ class ExtraPackage:
     agent: AgentLaunch | None = None
 
 
-# Extract a GitHub release tag without depending on jq (which is an optional
-# APT group). Used by entries whose release assets embed the version.
-_LATEST_TAG = 'sed -n \'s/.*"tag_name": *"\\([^"]*\\)".*/\\1/p\' | head -1'
+# A bare dotted version, wherever it is embedded — in a release tag or in the
+# noise a tool's `--version` prints around it. This is the POSIX-ERE twin of
+# `_VERSION_RE` below, which asks the same question of `--version` output in
+# Python; ERE has no `\d` or `\w`, so the two cannot be one constant.
+_VERSION_ERE = "[0-9]+\\.[0-9]+[0-9A-Za-z.+-]*"
+
+# Read a release version off a URL ending in a release tag. Tag conventions
+# differ — `v0.13.1` for typst, `tectonic@0.17.0` for tectonic, and the release
+# feed percent-encodes that `@` — so drop everything up to the last separator
+# before taking the version. Reads the URL on stdin.
+_TAG_URL_TO_VERSION = f'sed "s|.*/||; s|.*%40||; s|.*@||" | grep -oE "{_VERSION_ERE}" | head -1'
 _EXTRAS_DIR = "$HOME/.local/share/agent-extras"
 
 
@@ -357,25 +368,53 @@ def _astral_install(tool: str) -> str:
     return f"curl -LsSf https://astral.sh/{tool}/install.sh | INSTALLER_NO_MODIFY_PATH=1 sh"
 
 
-def _skip_if_latest(exe: str, repo: str) -> str:
+def _resolve_latest_version(repo: str, tag_prefix: str = "") -> str:
+    """Set `$latest` to the version of a project's newest release.
+
+    Resolved through the redirect on /releases/latest rather than the API, which
+    is capped at 60 unauthenticated requests per hour per IP — tectonic builds
+    its download URL out of this value, so a rate-limit hit there would fail an
+    install, not just a version check. The redirect also settles which release
+    counts as current: it names the newest non-prerelease, where the release
+    feed lists the `-rc` tags that typst and ollama never ship as downloads.
+
+    `tag_prefix` is for monorepos that publish several crates under one tag
+    namespace. Tectonic releases `tectonic_pdf_io@…` and friends alongside
+    `tectonic@…`, so /releases/latest can name a crate rather than the program;
+    when it does, fall back to the newest matching tag in the release feed. The
+    feed alone would not do — one batch of crate releases is enough to push the
+    program's own tag off the feed's first page."""
+    resolve = f"latest=$(curl -fsSL -o /dev/null -w '%{{url_effective}}' https://github.com/{repo}/releases/latest)\n"
+    if tag_prefix:
+        resolve += (
+            f'case "${{latest##*/}}" in {tag_prefix}@*|{tag_prefix}%40*) ;;\n'
+            f"  *) latest=$(curl -fsSL https://github.com/{repo}/releases.atom"
+            f' | grep -oE "releases/tag/{tag_prefix}(@|%40)[0-9A-Za-z.+_-]*" | head -1) ;;\n'
+            "esac\n"
+        )
+    return resolve + f'latest=$(printf %s "$latest" | {_TAG_URL_TO_VERSION})\n'
+
+
+def _skip_if_latest(exe: str, repo: str, tag_prefix: str = "") -> str:
     """Guard for installers that always download a whole release: leave early when
-    the installed tool already reports the latest published tag. Anything
-    uncertain — no tool, no tag, an unparsable version — falls through and
-    reinstalls, so the guard can only ever save work, never skip a real update."""
+    the installed tool already reports the latest published version. Anything
+    uncertain — no tool, no version resolved, an unparsable version — falls
+    through and reinstalls, so the guard can only ever save work, never skip a
+    real update. Leaves the resolved version in `$latest` for installers whose
+    download URL needs it."""
     return (
-        f"if command -v {exe} >/dev/null 2>&1; then\n"
-        f"  latest=$(curl -fsSL https://api.github.com/repos/{repo}/releases/latest | {_LATEST_TAG})\n"
-        f'  have=$({exe} --version 2>&1 | grep -oE "[0-9]+\\.[0-9]+[0-9A-Za-z.+-]*" | head -1)\n'
-        '  if [ -n "$latest" ] && [ -n "$have" ] && [ "${latest#v}" = "$have" ]; then exit 0; fi\n'
+        _resolve_latest_version(repo, tag_prefix) + f"if command -v {exe} >/dev/null 2>&1; then\n"
+        f'  have=$({exe} --version 2>&1 | grep -oE "{_VERSION_ERE}" | head -1)\n'
+        '  if [ -n "$latest" ] && [ -n "$have" ] && [ "$latest" = "$have" ]; then exit 0; fi\n'
         "fi\n"
     )
 
 
-# The two tarball entries below install a prebuilt upstream release into an
+# The three tarball entries below install a prebuilt upstream release into an
 # Agent-owned directory and expose one symlink on PATH. Everything they write
-# lives under paths the registry entry declares, so removal is exact. Neither
-# tool can update itself, so the whole release is re-downloaded on every update
-# run — hence the version guard in front of each.
+# lives under paths the registry entry declares, so removal is exact. None of
+# these tools can update itself, so the whole release is re-downloaded on every
+# update run — hence the version guard in front of each.
 
 _TYPST_INSTALL = (
     _skip_if_latest("typst", "typst/typst") + "set -e\n"
@@ -385,6 +424,23 @@ _TYPST_INSTALL = (
     'curl -fsSL "https://github.com/typst/typst/releases/latest/download/typst-$(uname -m)-unknown-linux-musl.tar.xz"'
     f' | tar -xJ -C "{_EXTRAS_DIR}/typst" --strip-components=1\n'
     f'ln -sfn "{_EXTRAS_DIR}/typst/typst" "$HOME/.local/bin/typst"\n'
+)
+
+_TECTONIC_INSTALL = (
+    # Tectonic's asset names embed the version, so unlike the two entries around
+    # it there is no /releases/latest/download/<name> shortcut: the URL is built
+    # from the version the guard already resolved. The musl build is static and
+    # is the only one published for both architectures. The tarball holds a
+    # single `tectonic` binary, hence no --strip-components.
+    _skip_if_latest("tectonic", "tectonic-typesetting/tectonic", tag_prefix="tectonic") + "set -e\n"
+    '[ -n "$latest" ] || { echo "cannot resolve the latest Tectonic release" >&2; exit 1; }\n'
+    'mkdir -p "$HOME/.local/bin"\n'
+    f'rm -rf "{_EXTRAS_DIR}/tectonic"\n'
+    f'mkdir -p "{_EXTRAS_DIR}/tectonic"\n'
+    'curl -fsSL "https://github.com/tectonic-typesetting/tectonic/releases/download'
+    '/tectonic@$latest/tectonic-$latest-$(uname -m)-unknown-linux-musl.tar.gz"'
+    f' | tar -xz -C "{_EXTRAS_DIR}/tectonic"\n'
+    f'ln -sfn "{_EXTRAS_DIR}/tectonic/tectonic" "$HOME/.local/bin/tectonic"\n'
 )
 
 _OLLAMA_INSTALL = (
@@ -475,6 +531,19 @@ EXTRA_REGISTRY: tuple[ExtraPackage, ...] = (
         update=_TYPST_INSTALL,
         owned_paths=(".local/share/agent-extras/typst", ".local/bin/typst"),
         executables=("typst",),
+    ),
+    ExtraPackage(
+        id="tectonic",
+        label="Tectonic",
+        description="Self-contained LaTeX engine; needs no TeX Live installation.",
+        install=_TECTONIC_INSTALL,
+        update=_TECTONIC_INSTALL,
+        # Tectonic downloads the TeX files a document needs on first use, into
+        # ~/.cache/tectonic — tens of MB and growing with what gets compiled.
+        # It is not claimed here: entries own what their installer wrote, never
+        # a user's state, so deselecting tectonic leaves that cache behind.
+        owned_paths=(".local/share/agent-extras/tectonic", ".local/bin/tectonic"),
+        executables=("tectonic",),
     ),
     ExtraPackage(
         id="claude-code",

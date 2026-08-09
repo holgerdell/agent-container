@@ -110,8 +110,9 @@ class TestDefaults:
         assert result is not None
         assert result.mount_mode == "repo_root"
         assert result.coding_agent == agent.DEFAULT_AGENT_ID
-        for pkg in ("git", "texlive-xetex", "python3", "ripgrep"):
+        for pkg in ("git", "python3", "ripgrep"):
             assert pkg in result.apt_packages
+        assert "texlive-xetex" not in result.apt_packages
         for extra in ("uv", "claude-code", "typst", "ollama"):
             assert extra in result.extra_packages
 

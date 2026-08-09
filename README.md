@@ -78,7 +78,7 @@ If the image was built from a different selection than your settings currently d
 
 ### Extra tools
 
-These come from a small curated registry baked into the script — `uv`, `bun`, `ruff`, `ty`, `typos`, `typst`, `claude-code`, `codex`, `mistral-vibe`, `opencode`, and `ollama`. Each entry defines its own install, update, and removal routine using the tool's official upstream mechanism, plus the exact paths under `/home/agent` it owns.
+These come from a small curated registry baked into the script — `uv`, `bun`, `ruff`, `ty`, `typos`, `typst`, `tectonic`, `claude-code`, `codex`, `mistral-vibe`, `opencode`, and `ollama`. Each entry defines its own install, update, and removal routine using the tool's official upstream mechanism, plus the exact paths under `/home/agent` it owns.
 
 They are installed into the persistent home volume, which is shared by every repository, so you install and update them once per user. Deselecting a tool removes only the files that tool's registry entry declares; anything you installed yourself is never touched.
 

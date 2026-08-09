@@ -1,9 +1,11 @@
 """Pure-logic tests for the native extra-package registry and reconciliation.
 
 The planner and state machine are tested against a small synthetic registry so
-they stay independent of the eleven real installers; the curated registry itself
+they stay independent of the twelve real installers; the curated registry itself
 is checked for the invariants that keep removal safe.
 """
+
+import subprocess
 
 from tests.agent_module import agent
 
@@ -58,7 +60,7 @@ class TestSelectionParsing:
         assert list(agent.DEFAULT_EXTRA_PACKAGES) == agent.registry_ids()
 
     def test_supplied_product_catalog_is_present(self):
-        supplied = {"bun", "claude-code", "codex", "mistral-vibe", "ollama", "opencode", "ruff", "ty", "typos", "typst", "uv"}
+        supplied = {"bun", "claude-code", "codex", "mistral-vibe", "ollama", "opencode", "ruff", "tectonic", "ty", "typos", "typst", "uv"}
         assert supplied == set(agent.registry_ids())
 
 
@@ -285,3 +287,63 @@ class TestVersionReporting:
         assert "exit 0" in guard and "releases/latest" in guard
         # The exit is reached before anything is fetched or deleted.
         assert "tar --zstd" in download and "rm -rf" in download
+
+    def test_tectonic_does_not_redownload_when_it_is_already_the_latest_release(self):
+        script = agent.extra_by_id("tectonic").update
+        guard, _, download = script.partition("set -e\n")
+        assert "exit 0" in guard and "releases/latest" in guard
+        assert "tar -xz" in download and "rm -rf" in download
+
+    def test_tectonic_downloads_the_release_the_guard_resolved(self):
+        # Tectonic's asset names embed the version, so the tag the guard resolved
+        # has to reach the URL — a second lookup would be one more chance to fail.
+        assert "$latest" in agent.extra_by_id("tectonic").install.partition("set -e\n")[2]
+
+
+class TestReleaseVersionParsing:
+    """The guard resolves a release version out of the URL that
+    github.com/<repo>/releases/latest redirects to. Tag conventions differ
+    between projects, and a version that fails to parse silently disables the
+    guard, so the extraction is checked against the conventions in the registry."""
+
+    def _parse(self, url: str) -> str:
+        done = subprocess.run(
+            ["sh", "-c", agent._TAG_URL_TO_VERSION],
+            input=url,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return done.stdout.strip()
+
+    def test_reads_a_v_prefixed_tag(self):
+        assert self._parse("https://github.com/typst/typst/releases/tag/v0.13.1") == "0.13.1"
+
+    def test_reads_a_name_prefixed_tag(self):
+        url = "https://github.com/tectonic-typesetting/tectonic/releases/tag/tectonic@0.17.0"
+        assert self._parse(url) == "0.17.0"
+
+    def test_reads_a_tag_the_release_feed_percent_encoded(self):
+        url = "https://github.com/tectonic-typesetting/tectonic/releases/tag/tectonic%400.17.0"
+        assert self._parse(url) == "0.17.0"
+
+    def test_reports_nothing_for_a_url_without_a_version(self):
+        assert self._parse("https://github.com/tectonic-typesetting/tectonic/releases") == ""
+
+
+class TestMonorepoTagResolution:
+    """Tectonic publishes sibling crates — `tectonic_pdf_io@…` and a dozen more —
+    under the same tag namespace as the program, so /releases/latest can name a
+    crate release. Its version would then fail the guard and, worse, build a
+    download URL for an asset that does not exist."""
+
+    def test_tectonic_falls_back_to_the_release_feed(self):
+        guard = agent.extra_by_id("tectonic").install
+        assert "releases.atom" in guard
+        assert "releases/tag/tectonic(@|%40)" in guard
+
+    def test_single_project_repos_ask_only_for_the_redirect(self):
+        # The feed lists -rc tags that typst and ollama never publish downloads
+        # for, so consulting it unconditionally would break their guards.
+        for entry_id in ("typst", "ollama"):
+            assert "releases.atom" not in agent.extra_by_id(entry_id).install

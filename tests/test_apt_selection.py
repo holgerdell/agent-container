@@ -39,15 +39,21 @@ class TestCatalog:
                 assert pkg not in seen, f"{pkg} is in both {seen.get(pkg)} and {group.id}"
                 seen[pkg] = group.id
 
-    def test_defaults_are_the_whole_catalog(self):
-        assert set(agent.default_apt_packages()) == agent.catalog_packages()
+    def test_defaults_are_every_group_that_defaults_on(self):
+        on_groups = [g for g in agent.APT_GROUPS if g.default_on]
+        assert set(agent.default_apt_packages()) == agent.catalog_packages(on_groups)
+
+    def test_latex_defaults_off(self):
+        latex = next(g for g in agent.APT_GROUPS if g.id == "latex")
+        assert latex.default_on is False
+        assert not set(latex.packages) & set(agent.default_apt_packages())
 
     def test_defaults_cover_the_supplied_product_catalog(self):
         # The initial selection is seeded from the supplied packages.txt list,
         # minus `locales`: the image gets UTF-8 from glibc's built-in C.UTF-8, so
-        # nothing needs generated locale data any more.
+        # nothing needs generated locale data any more. LaTeX packages are
+        # excluded since the latex group defaults off.
         supplied = {
-            "biber",
             "build-essential",
             "curl",
             "git",
@@ -58,7 +64,6 @@ class TestCatalog:
             "python3",
             "ripgrep",
             "starship",
-            "texlive-xetex",
             "zstd",
         }
         assert supplied <= set(agent.default_apt_packages())
