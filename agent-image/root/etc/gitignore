@@ -7,7 +7,6 @@ ehthumbs.db
 Thumbs.db
 desktop.ini
 .venv
-.venv-linux
 .venv-macos
 __pycache__
 .ruff_cache

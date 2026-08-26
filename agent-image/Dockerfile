@@ -62,13 +62,27 @@ RUN set -eux; \
 # state. Codex and Mistral Vibe only ever offer an upgrade and wait to be told, so
 # they are left alone — muting them would mean writing into the user's own config
 # files, which `agent` otherwise never touches.
+#
+# UV_PREVIEW_FEATURES moves project virtualenvs out of the project tree and into
+# the uv cache under $HOME, keyed by project path so nested projects in one repo
+# still get their own. The workspace is a bind mount, and installing a virtualenv
+# into it does not merely run slowly — it fails partway through with a missing
+# source file. uv leaves a `.venv` symlink behind for editors, which the shipped
+# gitignore covers. Two caveats: `uv cache clean`/`prune` drops every one of these
+# environments rather than just orphaned ones, and an unrecognised preview name is
+# only warned about, so a later rename would quietly put them back in the mount.
+#
+# UV_PROJECT_ENVIRONMENT must stay unset, since any explicit path opts back out of
+# the above — and could not express it anyway: a relative value resolves inside the
+# project tree, and one absolute value would be shared by every project. UV_LINK_MODE
+# is unset for the reason it was once `copy`: that pinning only existed because uv
+# cannot reflink or hardlink out of its cache across the bind-mount boundary.
 ENV HOME=/home/agent \
     PATH=${AGENT_PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     EDITOR=nvim \
     VISUAL=nvim \
     NPM_CONFIG_PREFIX=/home/agent/.local \
-    UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=.venv-linux \
+    UV_PREVIEW_FEATURES=centralized-project-envs \
     UV_PYTHON_PREFERENCE=only-system \
     DEVCONTAINER=true \
     XDG_CONFIG_HOME=/home/agent/.config \
