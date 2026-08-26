@@ -148,7 +148,7 @@ APT_GROUPS: tuple[AptGroup, ...] = (
     AptGroup(
         "build",
         "Development & build tools",
-        "C/C++ toolchain, make, benchmarking, and the Lean toolchain manager.",
+        "C/C++ toolchain, make, benchmarking, a Java runtime, and the Lean toolchain manager.",
         (
             "build-essential",
             "clang",
@@ -156,6 +156,7 @@ APT_GROUPS: tuple[AptGroup, ...] = (
             "hyperfine",
             "make",
             "nauty",
+            "openjdk-25-jre-headless",
             "patch",
             "pkg-config",
             "time",
@@ -164,8 +165,9 @@ APT_GROUPS: tuple[AptGroup, ...] = (
     AptGroup(
         "python",
         "Python",
-        "System Python with a type checker and syntax highlighting.",
+        "System Python and PyPy, with a type checker and syntax highlighting.",
         (
+            "pypy3",
             "python3",
             "python3-mypy",
             "python3-pygments",
@@ -1757,7 +1759,7 @@ def build_reconcile_script(ops: list[ExtraOp], registry: tuple[ExtraPackage, ...
     operation's failure never stops the ones after it — exactly as when each ran
     in its own container."""
     before_entries = [e for op in ops if op.action != ACTION_REMOVE and (e := extra_by_id(op.package_id, registry)) and e.executables]
-    lines = ["set +e", _version_snapshot_block(before_entries, "before"), '__lock=$(mktemp)', "__pids=()"]
+    lines = ["set +e", _version_snapshot_block(before_entries, "before"), "__lock=$(mktemp)", "__pids=()"]
     for op in ops:
         command = op_command(op, registry)
         entry = extra_by_id(op.package_id, registry)
@@ -1772,7 +1774,7 @@ def build_reconcile_script(ops: list[ExtraOp], registry: tuple[ExtraPackage, ...
         )
         if after_block:
             job += f'if [ "$__rc" -eq 0 ]; then\n{after_block}fi\n'
-        lines.append(f"(\n__blk=$( {{\n{job}}} )\n{{ flock -x 9; printf '%s\\n' \"$__blk\"; }} 9>\"$__lock\"\n) &")
+        lines.append(f'(\n__blk=$( {{\n{job}}} )\n{{ flock -x 9; printf \'%s\\n\' "$__blk"; }} 9>"$__lock"\n) &')
         lines.append('__pids+=("$!")')
         if op.package_id == "uv":
             lines.append('wait "${__pids[@]}"')
