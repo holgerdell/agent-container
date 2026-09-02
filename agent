@@ -9,6 +9,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ IMAGE_PREFIX = "agent:"
 # home-directory content, and is never removed by any `agent` command.
 HOME_VOLUME_PREFIX = "agent-home-"
 RUN_CONTAINER_PREFIX = "agent-run-"
+CONTAINER_SHELL = "/usr/bin/bash"
 CONTAINER_HOME = "/home/agent"
 # Where native upstream installers put their binaries. These must be on PATH for
 # interactive shells, coding-agent launches, and updater containers alike, so this
@@ -872,9 +874,10 @@ VENV_SCAN_SKIP = {".git", "node_modules"}
 
 
 def host_venvs(mount_root: Path) -> list[str]:
-    """Container paths of every `.venv` directory in the workspace, to be masked
-    with an empty tmpfs: a host venv is the wrong platform, and the container's own
-    lives on the home volume (see `project_env_dir`)."""
+    """Every `.venv` directory in the workspace, to be hidden under an empty tmpfs.
+    A host venv is the wrong platform for the container, whose own environments
+    live in the uv cache on the home volume (UV_PREVIEW_FEATURES in the image); the
+    mask also keeps uv's `.venv` link off the bind mount."""
     found: list[str] = []
 
     def walk(directory: Path, depth: int) -> None:
@@ -892,12 +895,6 @@ def host_venvs(mount_root: Path) -> list[str]:
 
     walk(mount_root, 1)
     return found
-
-
-def project_env_dir(mount_root: Path) -> str:
-    """Per-repo uv project environment on the home volume, so the venv lives on
-    the container's own disk instead of the bind-mounted workspace."""
-    return f"{CONTAINER_HOME}/.venvs/{mount_digest(mount_root)}"
 
 
 # --- Settings ----------------------------------------------------------------
@@ -1242,7 +1239,8 @@ HELP_TEXT = f"""\
 
 Launch a Debian-based agent workspace in the current directory.
 With no subcommand, runs the default coding agent. Extra args after `--`
-are forwarded to that agent (or to bash with `shell`).
+are forwarded to that agent; with `shell` they are run as one command
+inside the container and the exit status is returned.
 
 {bold("Options:")}
   {bold("--help")}                  Show this help message and exit
@@ -1251,7 +1249,8 @@ are forwarded to that agent (or to bash with `shell`).
 
 {bold("Subcommands:")}
   {bold("setup")}    Configure agent (interactive)
-  {bold("shell")}    Open a bash shell instead of the coding agent
+  {bold("shell")}    Open a bash shell instead of the coding agent, or run
+           the command after `--` (e.g. {bold("agent shell -- just test")})
   {bold("build")}    Rebuild the Debian image from the selected APT packages
            (always pulls a fresh base; {bold("--refresh")} also reinstalls every
            package from scratch), then reconcile native extra tools
@@ -2194,7 +2193,7 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
     # static KEY=value from settings; a bare pass-through name would freeze its
     # value at create until `agent stop`.
     env_values = list(settings.env_vars)
-    env_values.append(f"UV_PROJECT_ENVIRONMENT={project_env_dir(mount_root)}")
+    env_values.append(f"SHELL={CONTAINER_SHELL}")
 
     # SSH agent forwarding — key never enters the container.
     # macOS + Docker Desktop: socket injected by Docker Desktop at a fixed path.
@@ -2897,8 +2896,12 @@ def main() -> None:
     if sys.stdin.isatty():
         exec_cmd.append("-t")
     exec_cmd += ["-w", str(cwd), spec.name]
-    if cmd == "shell":
-        exec_cmd += ["bash", *extra]
+    if cmd == "shell" and extra:
+        # A login shell, so the extras' PATH applies; the command is joined
+        # shell-quoted so each host argument stays one container argument.
+        exec_cmd += [CONTAINER_SHELL, "-lc", shlex.join(extra)]
+    elif cmd == "shell":
+        exec_cmd += [CONTAINER_SHELL]
         _progress(f"{_sty('1;34', '→')} Starting shell...")
     else:
         # No pre-flight check that the executable exists: if the backing extra

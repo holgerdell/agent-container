@@ -382,7 +382,13 @@ class TestLaunch:
     def test_shell_subcommand_starts_bash(self, env):
         env.write_state(built(env))
         r = env.run("shell")
-        assert "bash" in r.ops("exec")[0]["argv"]
+        assert agent.CONTAINER_SHELL in r.ops("exec")[0]["argv"]
+
+    def test_shell_extras_run_as_one_command_in_a_login_shell(self, env):
+        env.write_state(built(env))
+        r = env.run("shell", "--", "echo", "hello world")
+        argv = r.ops("exec")[0]["argv"]
+        assert argv[-3:] == [agent.CONTAINER_SHELL, "-lc", "echo 'hello world'"]
 
     def _first_launch(self, env) -> str:
         """Launch once so the session container exists exactly as Agent creates
@@ -440,15 +446,6 @@ class TestLaunch:
         assert f"{HOME_VOLUME}:/home/agent" in created["mounts"]
         assert not any(m.startswith(f"{HOME_VOLUME}:") and m.endswith(":ro") for m in created["mounts"])
 
-    def test_uv_project_environment_lives_on_the_home_volume(self, env):
-        env.write_state(built(env))
-        r = env.run()
-        (created,) = [e for e in r.ops("run") if e.get("detached")]
-        root = env.root.resolve()
-        assert f"UV_PROJECT_ENVIRONMENT={agent.project_env_dir(root)}" in created["env"]
-        assert agent.project_env_dir(root).startswith("/home/agent/")
-        assert agent.project_env_dir(root) != agent.project_env_dir(root / "other")
-
     def test_host_venvs_are_masked_with_an_empty_tmpfs(self, env):
         env.write_state(built(env))
         (env.root / ".venv").mkdir()
@@ -458,6 +455,13 @@ class TestLaunch:
         (created,) = [e for e in r.ops("run") if e.get("detached")]
         root = env.root.resolve()
         assert set(created["tmpfs"]) == {str(root / ".venv"), str(root / "sub" / ".venv")}
+        assert not any("UV_PROJECT_ENVIRONMENT" in e for e in created["env"])
+
+    def test_shell_is_bash_inside_the_container(self, env):
+        env.write_state(built(env))
+        r = env.run()
+        (created,) = [e for e in r.ops("run") if e.get("detached")]
+        assert f"SHELL={agent.CONTAINER_SHELL}" in created["env"]
 
 
 class TestStop:

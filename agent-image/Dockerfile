@@ -67,16 +67,14 @@ RUN set -eux; \
 # the uv cache under $HOME, keyed by project path so nested projects in one repo
 # still get their own. The workspace is a bind mount, and installing a virtualenv
 # into it does not merely run slowly — it fails partway through with a missing
-# source file. uv leaves a `.venv` symlink behind for editors, which the shipped
-# gitignore covers. Two caveats: `uv cache clean`/`prune` drops every one of these
+# source file. uv leaves a `.venv` symlink behind for editors; `agent` hides every
+# host `.venv` under an empty tmpfs, so the link never lands on the bind mount and
+# the host's own venv is never seen from inside. Two caveats: `uv cache clean`/`prune` drops every one of these
 # environments rather than just orphaned ones, and an unrecognised preview name is
 # only warned about, so a later rename would quietly put them back in the mount.
 #
-# UV_PROJECT_ENVIRONMENT must stay unset, since any explicit path opts back out of
-# the above — and could not express it anyway: a relative value resolves inside the
-# project tree, and one absolute value would be shared by every project. UV_LINK_MODE
-# is unset for the reason it was once `copy`: that pinning only existed because uv
-# cannot reflink or hardlink out of its cache across the bind-mount boundary.
+# UV_LINK_MODE is unset for the reason it was once `copy`: that pinning only existed
+# because uv cannot reflink or hardlink out of its cache across the bind-mount boundary.
 ENV HOME=/home/agent \
     PATH=${AGENT_PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     EDITOR=nvim \
