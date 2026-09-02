@@ -31,6 +31,7 @@ IMAGE_PREFIX = "agent:"
 # home-directory content, and is never removed by any `agent` command.
 HOME_VOLUME_PREFIX = "agent-home-"
 RUN_CONTAINER_PREFIX = "agent-run-"
+SHADOW_VOLUME_PREFIX = "agent-shadow-"
 CONTAINER_SHELL = "/usr/bin/bash"
 CONTAINER_HOME = "/home/agent"
 # Where native upstream installers put their binaries. These must be on PATH for
@@ -869,15 +870,20 @@ def run_container_name(username: str, mount_root: Path) -> str:
     return f"{RUN_CONTAINER_PREFIX}{username}-{mount_digest(mount_root)}"
 
 
-VENV_SCAN_DEPTH = 4
-VENV_SCAN_SKIP = {".git", "node_modules"}
+# Host build trees are the wrong platform for the container, so each one found in
+# the workspace is hidden behind a mount at the same path. `.venv` gets an empty
+# tmpfs: the container's own environments live in the uv cache on the home volume
+# (UV_PREVIEW_FEATURES in the image), and the mask only keeps uv's `.venv` link off
+# the bind mount. `.lake` gets a named volume (`shadow_volume`): Lake has no such
+# cache, so the container's build must persist at the usual path on its own disk.
+SHADOW_TMPFS = {".venv"}
+SHADOW_VOLUME = {".lake"}
+SHADOW_SCAN_DEPTH = 4
+SHADOW_SCAN_SKIP = {".git", "node_modules"}
 
 
-def host_venvs(mount_root: Path) -> list[str]:
-    """Every `.venv` directory in the workspace, to be hidden under an empty tmpfs.
-    A host venv is the wrong platform for the container, whose own environments
-    live in the uv cache on the home volume (UV_PREVIEW_FEATURES in the image); the
-    mask also keeps uv's `.venv` link off the bind mount."""
+def host_shadows(mount_root: Path, names: set[str]) -> list[str]:
+    """Paths of every directory in the workspace whose name is in `names`."""
     found: list[str] = []
 
     def walk(directory: Path, depth: int) -> None:
@@ -888,13 +894,19 @@ def host_venvs(mount_root: Path) -> list[str]:
         for entry in entries:
             if not entry.is_dir() or entry.is_symlink():
                 continue
-            if entry.name == ".venv":
-                found.append(str(entry))
-            elif entry.name not in VENV_SCAN_SKIP and depth < VENV_SCAN_DEPTH:
+            if entry.name in SHADOW_TMPFS | SHADOW_VOLUME:
+                if entry.name in names:
+                    found.append(str(entry))
+            elif entry.name not in SHADOW_SCAN_SKIP and depth < SHADOW_SCAN_DEPTH:
                 walk(entry, depth + 1)
 
     walk(mount_root, 1)
     return found
+
+
+def shadow_volume(username: str, path: str) -> str:
+    """Per-user, per-path named volume that shadows one host build tree."""
+    return f"{SHADOW_VOLUME_PREFIX}{username}-{mount_digest(Path(path))}"
 
 
 # --- Settings ----------------------------------------------------------------
@@ -2194,6 +2206,7 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
     # value at create until `agent stop`.
     env_values = list(settings.env_vars)
     env_values.append(f"SHELL={CONTAINER_SHELL}")
+    mount_specs += [f"{shadow_volume(username, p)}:{p}" for p in host_shadows(mount_root, SHADOW_VOLUME)]
 
     # SSH agent forwarding — key never enters the container.
     # macOS + Docker Desktop: socket injected by Docker Desktop at a fixed path.
@@ -2213,7 +2226,7 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
         user=f"{uid}:{gid}",
         mounts=mount_specs,
         env=env_values,
-        tmpfs=host_venvs(mount_root),
+        tmpfs=host_shadows(mount_root, SHADOW_TMPFS),
     )
 
 

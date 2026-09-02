@@ -457,6 +457,17 @@ class TestLaunch:
         assert set(created["tmpfs"]) == {str(root / ".venv"), str(root / "sub" / ".venv")}
         assert not any("UV_PROJECT_ENVIRONMENT" in e for e in created["env"])
 
+    def test_host_lake_trees_are_shadowed_by_named_volumes(self, env):
+        env.write_state(built(env))
+        (env.root / "lean" / ".lake").mkdir(parents=True)
+        (env.root / "lean" / ".lake" / ".venv").mkdir()
+        r = env.run()
+        (created,) = [e for e in r.ops("run") if e.get("detached")]
+        lake = str((env.root / "lean" / ".lake").resolve())
+        shadows = [m for m in created["mounts"] if m.startswith(agent.SHADOW_VOLUME_PREFIX)]
+        assert shadows == [f"{agent.shadow_volume('hold', lake)}:{lake}"]
+        assert created["tmpfs"] == []
+
     def test_shell_is_bash_inside_the_container(self, env):
         env.write_state(built(env))
         r = env.run()
