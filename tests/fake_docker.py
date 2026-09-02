@@ -177,6 +177,7 @@ def cmd_build(state: dict, argv: list[str]) -> int:
 def cmd_run(state: dict, argv: list[str]) -> int:
     mounts = all_flag_values(argv, "-v")
     envs = all_flag_values(argv, "-e")
+    tmpfs = all_flag_values(argv, "--tmpfs")
     detached = "-d" in argv
     script = argv[-1] if len(argv) >= 2 and argv[-2] == "-lc" else None
     entry = {
@@ -184,6 +185,7 @@ def cmd_run(state: dict, argv: list[str]) -> int:
         "detached": detached,
         "mounts": mounts,
         "env": envs,
+        "tmpfs": tmpfs,
         "user": flag_value(argv, "--user"),
         "name": flag_value(argv, "--name"),
         "pull": flag_value(argv, "--pull") or ("--pull=never" if "--pull=never" in argv else None),

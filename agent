@@ -857,10 +857,47 @@ def home_volume(username: str) -> str:
     return f"{HOME_VOLUME_PREFIX}{username}"
 
 
+def mount_digest(mount_root: Path) -> str:
+    """Short stable digest of the mounted root, keying per-repo state."""
+    return hashlib.sha256(str(mount_root).encode()).hexdigest()[:12]
+
+
 def run_container_name(username: str, mount_root: Path) -> str:
     """Per-repo persistent container name, keyed by the user and mounted root."""
-    digest = hashlib.sha256(str(mount_root).encode()).hexdigest()[:12]
-    return f"{RUN_CONTAINER_PREFIX}{username}-{digest}"
+    return f"{RUN_CONTAINER_PREFIX}{username}-{mount_digest(mount_root)}"
+
+
+VENV_SCAN_DEPTH = 4
+VENV_SCAN_SKIP = {".git", "node_modules"}
+
+
+def host_venvs(mount_root: Path) -> list[str]:
+    """Container paths of every `.venv` directory in the workspace, to be masked
+    with an empty tmpfs: a host venv is the wrong platform, and the container's own
+    lives on the home volume (see `project_env_dir`)."""
+    found: list[str] = []
+
+    def walk(directory: Path, depth: int) -> None:
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if entry.name == ".venv":
+                found.append(str(entry))
+            elif entry.name not in VENV_SCAN_SKIP and depth < VENV_SCAN_DEPTH:
+                walk(entry, depth + 1)
+
+    walk(mount_root, 1)
+    return found
+
+
+def project_env_dir(mount_root: Path) -> str:
+    """Per-repo uv project environment on the home volume, so the venv lives on
+    the container's own disk instead of the bind-mounted workspace."""
+    return f"{CONTAINER_HOME}/.venvs/{mount_digest(mount_root)}"
 
 
 # --- Settings ----------------------------------------------------------------
@@ -2105,6 +2142,7 @@ class RunSpec:
     user: str
     mounts: list[str]
     env: list[str]
+    tmpfs: list[str] = field(default_factory=list)
     ulimit: str = "nofile=524288:524288"
     memswap: str = "-1"
 
@@ -2114,6 +2152,7 @@ class RunSpec:
             {
                 "image_id": self.image_id,
                 "mounts": sorted(self.mounts),
+                "tmpfs": sorted(self.tmpfs),
                 "env": sorted(self.env),
                 "user": self.user,
                 "ulimit": self.ulimit,
@@ -2155,6 +2194,7 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
     # static KEY=value from settings; a bare pass-through name would freeze its
     # value at create until `agent stop`.
     env_values = list(settings.env_vars)
+    env_values.append(f"UV_PROJECT_ENVIRONMENT={project_env_dir(mount_root)}")
 
     # SSH agent forwarding — key never enters the container.
     # macOS + Docker Desktop: socket injected by Docker Desktop at a fixed path.
@@ -2174,6 +2214,7 @@ def build_run_spec(engine: str, settings: Settings, image: str, mount_root: Path
         user=f"{uid}:{gid}",
         mounts=mount_specs,
         env=env_values,
+        tmpfs=host_venvs(mount_root),
     )
 
 
@@ -2193,6 +2234,7 @@ def create_run_container(engine: str, spec: RunSpec) -> None:
     _progress(f"{_sty('1;34', '→')} Starting session container...")
     mount_flags = [arg for m in spec.mounts for arg in ("-v", m)]
     env_flags = [arg for e in spec.env for arg in ("-e", e)]
+    tmpfs_flags = [arg for t in spec.tmpfs for arg in ("--tmpfs", t)]
     cmd = [
         engine,
         "run",
@@ -2206,6 +2248,7 @@ def create_run_container(engine: str, spec: RunSpec) -> None:
         "--ulimit",
         spec.ulimit,
         *mount_flags,
+        *tmpfs_flags,
         *env_flags,
         "--label",
         f"agent.fingerprint={spec.fingerprint}",
