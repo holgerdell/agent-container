@@ -35,6 +35,7 @@ Then run `agent setup` to configure workspace options and pick your packages. Th
 ```sh
 agent              # run your default coding agent in the current directory
 agent shell        # open bash instead
+agent shell -- CMD # run one command in the container and return its exit status
 agent setup        # configure workspace, packages, agent, read-only host mounts
 agent build        # rebuild the Debian image, then reconcile extra tools
 agent update       # install/update/remove extra tools in the home volume

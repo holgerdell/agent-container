@@ -1,0 +1,16 @@
+#!/usr/bin/bash
+# uv wrapper: give every project its own environment under $HOME, keyed by the
+# project directory, so uv never creates a venv inside the bind-mounted workspace.
+# uv itself offers only one global UV_PROJECT_ENVIRONMENT, which every project in
+# a workspace would share. An explicit UV_PROJECT_ENVIRONMENT is left alone.
+if [ -z "${UV_PROJECT_ENVIRONMENT:-}" ]; then
+  d=$PWD
+  while [ "$d" != / ]; do
+    if [ -f "$d/pyproject.toml" ]; then
+      export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/$(printf %s "$d" | sha256sum | cut -c1-12)"
+      break
+    fi
+    d=$(dirname "$d")
+  done
+fi
+exec "$HOME/.local/bin/uv" "$@"

@@ -7,6 +7,7 @@ what durable state they left — rather than flag order or temp-file details.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -446,27 +447,46 @@ class TestLaunch:
         assert f"{HOME_VOLUME}:/home/agent" in created["mounts"]
         assert not any(m.startswith(f"{HOME_VOLUME}:") and m.endswith(":ro") for m in created["mounts"])
 
-    def test_host_venvs_are_masked_with_an_empty_tmpfs(self, env):
+    def test_host_venvs_are_masked_and_lake_trees_get_volumes(self, env):
         env.write_state(built(env))
         (env.root / ".venv").mkdir()
-        (env.root / "sub" / ".venv").mkdir(parents=True)
+        (env.root / "lean").mkdir()
+        (env.root / "lean" / "lakefile.toml").touch()
+        (env.root / "lean" / ".venv").mkdir()
         (env.root / ".git" / ".venv").mkdir(parents=True, exist_ok=True)
+        (env.root / ".git" / "lakefile.lean").touch()
         r = env.run()
         (created,) = [e for e in r.ops("run") if e.get("detached")]
         root = env.root.resolve()
-        assert set(created["tmpfs"]) == {str(root / ".venv"), str(root / "sub" / ".venv")}
-        assert not any("UV_PROJECT_ENVIRONMENT" in e for e in created["env"])
-
-    def test_host_lake_trees_are_shadowed_by_named_volumes(self, env):
-        env.write_state(built(env))
-        (env.root / "lean" / ".lake").mkdir(parents=True)
-        (env.root / "lean" / ".lake" / ".venv").mkdir()
-        r = env.run()
-        (created,) = [e for e in r.ops("run") if e.get("detached")]
-        lake = str((env.root / "lean" / ".lake").resolve())
+        assert created["tmpfs"] == [str(root / ".venv"), str(root / "lean" / ".venv")]
+        lake = str(root / "lean" / ".lake")
         shadows = [m for m in created["mounts"] if m.startswith(agent.SHADOW_VOLUME_PREFIX)]
         assert shadows == [f"{agent.shadow_volume('hold', lake)}:{lake}"]
-        assert created["tmpfs"] == []
+        assert not any("UV_PROJECT_ENVIRONMENT" in e for e in created["env"])
+
+    def test_uv_wrapper_dir_leads_the_path(self, env):
+        build = env.run("build").ops("build")[0]
+        assert build["build_args"]["AGENT_PATH"].startswith(agent.IMAGE_BIN_DIR + ":")
+        # The profile loop prepends in order, so the last listed entry ends up first.
+        listed = re.findall(r'"([^"]+)"', build["profile_script"].split("; do")[0])
+        assert listed[-1] == agent.IMAGE_BIN_DIR
+
+    def test_shadow_volumes_are_handed_to_the_session_user(self, env):
+        env.write_state(built(env))
+        (env.root / "lakefile.toml").touch()
+        r = env.run()
+        (created,) = [e for e in r.ops("run") if e.get("detached")]
+        chown = [e for e in r.ops("exec") if "chown" in e["argv"]]
+        assert len(chown) == 1
+        argv = chown[0]["argv"]
+        assert argv[argv.index("--user") + 1] == "0"
+        assert argv[argv.index("chown") + 1] == created["user"]
+        assert argv[-1] == str(env.root.resolve() / ".lake")
+
+    def test_no_shadow_means_no_chown(self, env):
+        env.write_state(built(env))
+        r = env.run()
+        assert not [e for e in r.ops("exec") if "chown" in e["argv"]]
 
     def test_shell_is_bash_inside_the_container(self, env):
         env.write_state(built(env))
