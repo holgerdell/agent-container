@@ -1,4 +1,4 @@
-# System-wide bashrc for the agent image, shipped from agent-image/root. Every
+# System-wide bashrc for the agent VM, shipped from guest-root. Every
 # interactive bash reads it, so nothing depends on files in the /home/agent volume.
 # PATH is handled by the image (ENV PATH, and the generated profile snippet for
 # login shells), not here.
@@ -33,7 +33,7 @@ PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}; }history -a; history -n"
 # ---------------------------------------------------------------------------
 
 git_branch() {
-	git branch --show-current 2>/dev/null | sed 's/.*/(&)/'
+    git branch --show-current 2>/dev/null | sed 's/.*/(&)/'
 }
 PS1='\[\e[32m\]\u@\h\[\e[0m\] \[\e[34m\]\w\[\e[0m\] \[\e[33m\]$(git_branch)\[\e[0m\]\$ '
 
@@ -64,9 +64,9 @@ shopt -s extglob
 
 # Load the system-installed bash-completion package.
 if [ -r /usr/share/bash-completion/bash_completion ]; then
-	source /usr/share/bash-completion/bash_completion
+    source /usr/share/bash-completion/bash_completion
 elif [ -r /etc/bash_completion ]; then
-	source /etc/bash_completion
+    source /etc/bash_completion
 fi
 
 # Case-insensitive completion.
@@ -129,7 +129,7 @@ alias path='printf "%s\n" "${PATH//:/\\n}"'
 
 # Colorized standard utilities.
 if command -v dircolors >/dev/null 2>&1; then
-	eval "$(dircolors -b)"
+    eval "$(dircolors -b)"
 fi
 
 alias ls='ls --color=auto'

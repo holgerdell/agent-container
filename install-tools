@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+status_start() {
+    printf '\n\033[1;34m==>\033[0m %s\n' "$1"
+}
+
+status_done() {
+    printf '\033[1;32m✓ %s\033[0m\n' "$1"
+}
+
+export PATH="${HOME}/.local/bin:${HOME}/.bun/bin:${HOME}/.opencode/bin:${PATH}"
+
+profile_path="${HOME}/.profile"
+path_export="export PATH=\"${HOME}/.local/bin:${HOME}/.bun/bin:${HOME}/.opencode/bin:\$PATH\""
+grep -Fqx "${path_export}" "${profile_path}" 2>/dev/null ||
+    printf '\n%s\n' "${path_export}" >>"${profile_path}"
+
+extras_dir="${HOME}/.local/share/agent-extras"
+
+version_of() {
+    command -v "$1" >/dev/null 2>&1 || return 0
+    "$1" --version 2>&1 |
+        grep -oE '[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' |
+        head -1
+}
+
+github_latest() {
+    curl -fsSLo /dev/null -w '%{url_effective}' \
+        "https://github.com/$1/releases/latest" |
+        sed 's|.*/||; s|.*%40||; s|.*@||; s|^v||'
+}
+
+install_release() {
+    local name=$1
+    local latest=$2
+    local url=$3
+    local binary=$4
+    local strip=${5:-0}
+    local current target work archive extract
+
+    current=$(version_of "${name}")
+    [[ ${current} == "${latest}" ]] && return
+
+    target="${extras_dir}/${name}"
+    mkdir -p "${extras_dir}"
+    work=$(mktemp -d "${extras_dir}/.install-${name}.XXXXXX")
+    archive="${work}/archive"
+    extract="${work}/extract"
+    mkdir "${extract}"
+
+    if ! curl -fsSL "${url}" -o "${archive}"; then
+        rm -rf "${work}"
+        return 1
+    fi
+
+    if ((strip)); then
+        if ! tar -xaf "${archive}" -C "${extract}" --strip-components="${strip}"; then
+            rm -rf "${work}"
+            return 1
+        fi
+    else
+        if ! tar -xaf "${archive}" -C "${extract}"; then
+            rm -rf "${work}"
+            return 1
+        fi
+    fi
+
+    mkdir -p "${HOME}/.local/bin"
+    rm -rf "${target}"
+    mv "${extract}" "${target}"
+    ln -sfn "${target}/${binary}" "${HOME}/.local/bin/${name}"
+    rm -rf "${work}"
+}
+
+status_start 'Setting up uv'
+if command -v uv >/dev/null 2>&1; then
+    uv self update
+else
+    curl -LsSf https://astral.sh/uv/install.sh |
+        INSTALLER_NO_MODIFY_PATH=1 sh
+fi
+status_done 'uv is ready'
+
+status_start 'Setting up Python tools'
+for tool in ruff ty typos mistral-vibe; do
+    uv tool install --upgrade "${tool}"
+done
+status_done 'Python tools are ready'
+
+status_start 'Setting up Bun'
+if command -v bun >/dev/null 2>&1; then
+    bun upgrade
+else
+    curl -fsSL https://bun.com/install |
+        BUN_INSTALL="${HOME}/.bun" SHELL=/bin/sh bash
+fi
+status_done 'Bun is ready'
+
+status_start 'Setting up Codex'
+codex_current=$(
+    bun pm ls -g 2>/dev/null |
+        sed -n 's/.*@openai\/codex@\([^ ]*\).*/\1/p' ||
+        true
+)
+if [[ -n ${codex_current} ]]; then
+    codex_latest=$(
+        cd "${HOME}/.bun/install/global"
+        bun pm view @openai/codex version
+    )
+    if [[ ${codex_current} != "${codex_latest}" ]]; then
+        bun install -g "@openai/codex@${codex_latest}"
+    fi
+else
+    bun install -g @openai/codex
+fi
+status_done 'Codex is ready'
+
+machine=$(uname -m)
+
+status_start 'Setting up Typst'
+typst_latest=$(github_latest typst/typst)
+install_release \
+    typst \
+    "${typst_latest}" \
+    "https://github.com/typst/typst/releases/latest/download/typst-${machine}-unknown-linux-musl.tar.xz" \
+    typst \
+    1
+status_done 'Typst is ready'
+
+status_start 'Setting up Tectonic'
+tectonic_latest=$(
+    curl -fsSL https://github.com/tectonic-typesetting/tectonic/releases.atom |
+        grep -oE 'releases/tag/tectonic(@|%40)[0-9A-Za-z.+_-]*' |
+        head -1 |
+        sed 's|.*/||; s|.*%40||; s|.*@||'
+)
+install_release \
+    tectonic \
+    "${tectonic_latest}" \
+    "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@${tectonic_latest}/tectonic-${tectonic_latest}-${machine}-unknown-linux-musl.tar.gz" \
+    tectonic
+status_done 'Tectonic is ready'
+
+case "${machine}" in
+aarch64 | arm64) ollama_arch=arm64 ;;
+*) ollama_arch=amd64 ;;
+esac
+
+status_start 'Setting up Ollama'
+ollama_latest=$(github_latest ollama/ollama)
+install_release \
+    ollama \
+    "${ollama_latest}" \
+    "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-${ollama_arch}.tar.zst" \
+    bin/ollama
+status_done 'Ollama is ready'
+
+status_start 'Setting up Claude'
+if command -v claude >/dev/null 2>&1; then
+    claude update
+else
+    curl -fsSL https://claude.ai/install.sh | bash
+fi
+status_done 'Claude is ready'
+
+status_start 'Setting up OpenCode'
+if command -v opencode >/dev/null 2>&1; then
+    opencode upgrade
+else
+    curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
+fi
+status_done 'OpenCode is ready'

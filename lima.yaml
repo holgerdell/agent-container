@@ -1,0 +1,55 @@
+minimumLimaVersion: 2.0.0
+
+base:
+  - template:_images/ubuntu-26.04
+
+plain: true
+
+user:
+  passwordlessSudo: true
+
+additionalDisks:
+  - name: agent-sandbox-home
+    format: true
+    fsType: ext4
+
+provision:
+  - mode: data
+    file: guest-root/etc/bash.bashrc
+    path: /etc/bash.bashrc
+    permissions: 644
+
+  - mode: data
+    file: guest-root/etc/gitconfig
+    path: /etc/gitconfig
+    permissions: 644
+
+  - mode: data
+    file: guest-root/etc/gitignore
+    path: /etc/gitignore
+    permissions: 644
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      guest_user='{{.User}}'
+      guest_home='{{.Home}}'
+      persistent_home=/mnt/lima-agent-sandbox-home/home
+      fstab_entry="${persistent_home} ${guest_home} none bind,x-systemd.requires-mounts-for=/mnt/lima-agent-sandbox-home 0 0"
+
+      install -d -o "${guest_user}" -g "${guest_user}" "${persistent_home}"
+      if ! find "${persistent_home}" -mindepth 1 -print -quit | grep -q .; then
+        cp -a "${guest_home}/." "${persistent_home}/"
+      fi
+      chown "${guest_user}:${guest_user}" "${persistent_home}"
+
+      mountpoint -q "${guest_home}" || mount --bind "${persistent_home}" "${guest_home}"
+      grep -Fqx "${fstab_entry}" /etc/fstab || printf '%s\n' "${fstab_entry}" >>/etc/fstab
+
+  - mode: system
+    file: install-system
+
+  - mode: user
+    file: install-tools
