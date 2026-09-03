@@ -3,7 +3,8 @@ minimumLimaVersion: 2.0.0
 base:
   - template:_images/ubuntu-26.04
 
-plain: true
+ssh:
+  forwardAgent: true
 
 user:
   passwordlessSudo: true

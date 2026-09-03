@@ -30,6 +30,7 @@ Commands:
   agent                       Launch the configured coding agent
   agent -- ARGS...            Forward arguments to the coding agent
   agent shell [--] COMMAND... Open a shell or run a command in the VM
+  agent git                   Ensure an 'agent' remote into the VM and push
   agent update                Update system packages and user tools
   agent help                  Show this help
 
@@ -101,6 +102,48 @@ shell)
     require_limactl
     require_instance
     exec limactl shell "${instance}" "$@"
+    ;;
+git)
+    if [[ $# -ne 1 ]]; then
+        echo "usage: agent git" >&2
+        exit 2
+    fi
+    require_limactl
+    require_instance
+    repo_root=$("${script_dir}/find-git-root") ||
+        {
+            echo "agent: not inside a git repository" >&2
+            exit 1
+        }
+    slug=$(basename -- "${repo_root}")
+    slug=${slug// /-}
+    # shellcheck disable=SC2088 # tilde is expanded remotely by git-upload/receive-pack
+    remote_path="~/src/${slug}"
+    if ! git -C "${repo_root}" remote get-url agent >/dev/null 2>&1; then
+        # A normal (non-bare) checkout, so the agent running inside the VM
+        # has a working tree to edit. updateInstead makes a push also
+        # update that working tree, refusing if it has uncommitted changes.
+        limactl shell "${instance}" -- bash -c \
+            "mkdir -p ~/src && git init ~/src/${slug} &&
+             git -C ~/src/${slug} config receive.denyCurrentBranch updateInstead"
+        git -C "${repo_root}" remote add agent \
+            "ext::limactl shell ${instance} -- %S ${remote_path}"
+    fi
+    git -C "${repo_root}" config protocol.ext.allow always
+    git -C "${repo_root}" fetch agent
+    # fast-forward only: leaves the checked-out branch alone if it has
+    # diverged from the VM's copy instead of merging or rebasing it.
+    branch=$(git -C "${repo_root}" symbolic-ref --quiet --short HEAD || true)
+    if [[ -n ${branch} ]] &&
+        git -C "${repo_root}" rev-parse --verify --quiet \
+            "refs/remotes/agent/${branch}" >/dev/null; then
+        git -C "${repo_root}" merge --ff-only "agent/${branch}" ||
+            echo "agent: '${branch}' diverged from agent/${branch}; not pulling" >&2
+    fi
+    # plain (non-force) push: refs that would not fast-forward are rejected
+    # instead of overwritten, so branches with diverging history are skipped.
+    git -C "${repo_root}" push agent --all
+    git -C "${repo_root}" push agent --tags
     ;;
 update)
     if [[ $# -ne 1 ]]; then
