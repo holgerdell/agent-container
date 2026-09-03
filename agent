@@ -11,7 +11,13 @@ if [[ -z ${AGENT_COMMAND+x} ]]; then
     agent_args=(--dangerously-skip-permissions)
     agent_command_hint+=" ${agent_args[*]}"
 fi
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+script_path=${BASH_SOURCE[0]}
+while [[ -L ${script_path} ]]; do
+    script_dir=$(cd -P -- "$(dirname -- "${script_path}")" && pwd)
+    script_path=$(readlink "${script_path}")
+    [[ ${script_path} = /* ]] || script_path="${script_dir}/${script_path}"
+done
+script_dir=$(cd -P -- "$(dirname -- "${script_path}")" && pwd)
 
 usage() {
     cat <<'EOF'
