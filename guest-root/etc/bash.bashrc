@@ -29,13 +29,22 @@ shopt -s histappend
 PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}; }history -a; history -n"
 
 # ---------------------------------------------------------------------------
-# Prompt: user@host, current folder, git branch.
+# Prompt: starship if available, otherwise user@host, current folder, git branch.
 # ---------------------------------------------------------------------------
 
 git_branch() {
     git branch --show-current 2>/dev/null | sed 's/.*/(&)/'
 }
 PS1='\[\e[32m\]\u@\h\[\e[0m\] \[\e[34m\]\w\[\e[0m\] \[\e[33m\]$(git_branch)\[\e[0m\]\$ '
+
+if command -v starship >/dev/null 2>&1; then
+    eval "$(starship init bash)"
+    # Keep history synchronized across concurrent sessions when starship
+    # manages PROMPT_COMMAND.
+    if [[ "${PROMPT_COMMAND:-}" != *'history -a'* ]]; then
+        PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}; }history -a; history -n"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Fish-like shell behavior
