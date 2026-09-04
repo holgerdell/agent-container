@@ -30,7 +30,7 @@ Commands:
   agent                       Launch the configured coding agent
   agent -- ARGS...            Forward arguments to the coding agent
   agent shell [--] COMMAND... Open a shell or run a command in the VM
-  agent git                   Ensure an 'agent' remote into the VM and push
+  agent git                   Show status of the 'agent' remote (read-only)
   agent update                Update system packages and user tools
   agent help                  Show this help
 
@@ -64,6 +64,22 @@ require_instance() {
 
 launch_agent() {
     exec limactl shell "${instance}" -- "${agent_command}" "${agent_args[@]}" "$@"
+}
+
+summarize_porcelain() {
+    local porcelain=$1 staged unstaged untracked summary
+    if [[ -z ${porcelain} ]]; then
+        echo "clean"
+        return
+    fi
+    staged=$(grep -c '^[MARCUDT]' <<<"${porcelain}" || true)
+    unstaged=$(grep -c '^.[MDT]' <<<"${porcelain}" || true)
+    untracked=$(grep -c '^??' <<<"${porcelain}" || true)
+    summary=""
+    if ((staged > 0)); then summary+="${staged} staged, "; fi
+    if ((unstaged > 0)); then summary+="${unstaged} unstaged, "; fi
+    if ((untracked > 0)); then summary+="${untracked} untracked, "; fi
+    echo "dirty (${summary%, })"
 }
 
 case "${1:-}" in
@@ -117,33 +133,84 @@ git)
         }
     slug=$(basename -- "${repo_root}")
     slug=${slug// /-}
-    # shellcheck disable=SC2088 # tilde is expanded remotely by git-upload/receive-pack
-    remote_path="~/src/${slug}"
-    if ! git -C "${repo_root}" remote get-url agent >/dev/null 2>&1; then
-        # A normal (non-bare) checkout, so the agent running inside the VM
-        # has a working tree to edit. updateInstead makes a push also
-        # update that working tree, refusing if it has uncommitted changes.
-        limactl shell "${instance}" -- bash -c \
-            "mkdir -p ~/src && git init ~/src/${slug} &&
-             git -C ~/src/${slug} config receive.denyCurrentBranch updateInstead"
-        git -C "${repo_root}" remote add agent \
-            "ext::limactl shell ${instance} -- %S ${remote_path}"
+    if remote_url=$(git -C "${repo_root}" remote get-url agent 2>/dev/null); then
+        remote_present=true
+        if [[ ${remote_url} == "ext::limactl shell ${instance} -- %S ~/src/${slug}" ]]; then
+            remote_info="set up (limactl shell ${instance})"
+        else
+            remote_info="${remote_url}"
+        fi
+    else
+        remote_present=false
+        remote_info="not set up"
     fi
-    git -C "${repo_root}" config protocol.ext.allow always
-    git -C "${repo_root}" fetch agent
-    # fast-forward only: leaves the checked-out branch alone if it has
-    # diverged from the VM's copy instead of merging or rebasing it.
-    branch=$(git -C "${repo_root}" symbolic-ref --quiet --short HEAD || true)
-    if [[ -n ${branch} ]] &&
-        git -C "${repo_root}" rev-parse --verify --quiet \
-            "refs/remotes/agent/${branch}" >/dev/null; then
-        git -C "${repo_root}" merge --ff-only "agent/${branch}" ||
-            echo "agent: '${branch}' diverged from agent/${branch}; not pulling" >&2
+    printf '%-12s %s\n' "agent remote" "${remote_info}"
+    # limactl shell passes arguments without a shell, so a literal '~'
+    # would never expand on the guest. Resolve the guest home first.
+    # shellcheck disable=SC2016 # $HOME must expand on the guest, not the host
+    if guest_home=$(limactl shell "${instance}" -- sh -c 'printf %s "$HOME"' 2>/dev/null) && [[ -n ${guest_home} ]]; then
+        guest_repo="${guest_home}/src/${slug}"
+    else
+        guest_repo=""
     fi
-    # plain (non-force) push: refs that would not fast-forward are rejected
-    # instead of overwritten, so branches with diverging history are skipped.
-    git -C "${repo_root}" push agent --all
-    git -C "${repo_root}" push agent --tags
+    printf '%-12s %s\n' "guest path" "${guest_repo:-~/src/${slug}}"
+    host_status=$(git -C "${repo_root}" status --porcelain)
+    host_summary=$(summarize_porcelain "${host_status}")
+    printf '%-12s %s\n' "host" "${host_summary}"
+    if [[ -n ${host_status} ]]; then
+        echo "  ${host_status//$'\n'/$'\n'  }"
+    fi
+    if [[ -z ${guest_repo} ]]; then
+        printf '%-12s %s\n' "guest" "unreachable (is the VM running?)"
+    elif limactl shell "${instance}" -- git -C "${guest_repo}" rev-parse --git-dir >/dev/null 2>&1; then
+        guest_status=$(limactl shell "${instance}" -- git -C "${guest_repo}" status --porcelain)
+        guest_summary=$(summarize_porcelain "${guest_status}")
+        printf '%-12s %s\n' "guest" "${guest_summary}"
+        if [[ -n ${guest_status} ]]; then
+            echo "  ${guest_status//$'\n'/$'\n'  }"
+        fi
+    else
+        printf '%-12s %s\n' "guest" "no repo at ${guest_repo}"
+    fi
+    if [[ ${remote_present} == false ]]; then
+        printf '%-12s %s\n' "refs" "unknown (agent remote not set up)"
+        exit 0
+    fi
+    # ls-remote queries the guest without updating local refs or configs.
+    if ! guest_raw=$(git -C "${repo_root}" -c protocol.ext.allow=always ls-remote agent 2>&1); then
+        echo "agent: failed to query guest refs" >&2
+        echo "${guest_raw}" >&2
+        exit 1
+    fi
+    local_refs=$(git -C "${repo_root}" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags | grep -v '\^{}' || true)
+    guest_refs=$(awk '$2 ~ /^refs\/(heads|tags)\// && $2 !~ /\^{}$/ {print $2" "$1}' <<<"${guest_raw}" | sort)
+    diverged=$(awk '
+        NF == 0 { next }
+        NR == FNR { local_ref[$1] = $2; next }
+        { guest_ref[$1] = $2 }
+        END {
+            count = 0
+            for (ref in local_ref) {
+                if (!(ref in guest_ref)) { print "  " ref " (only on host)"; count++ }
+            }
+            for (ref in guest_ref) {
+                if (!(ref in local_ref)) { print "  " ref " (only in guest)"; count++ }
+                else if (guest_ref[ref] != local_ref[ref]) { print "  " ref " (diverged)"; count++ }
+            }
+            if (count == 0) { print "all clean" }
+        }' <(printf '%s\n' "${local_refs}") <(printf '%s\n' "${guest_refs}"))
+    if [[ ${diverged} == "all clean" ]]; then
+        printf '%-12s %s\n' "refs" "all clean"
+    else
+        diverged_count=$(grep -c '^  ' <<<"${diverged}" || true)
+        printf '%-12s %s\n' "refs" "diverged (${diverged_count})"
+        echo "${diverged}"
+    fi
+    printf '\nTo pull everything from guest to host, fetch guest refs then fast-forward the current branch:\n'
+    # shellcheck disable=SC2016 # command text for the user; must stay literal
+    printf '%s\n' '  git -c protocol.ext.allow=always fetch agent && git merge --ff-only agent/$(git branch --show-current)'
+    printf 'To push everything from host to guest, push all branches and tags:\n'
+    printf '%s\n' '  git -c protocol.ext.allow=always push agent --all && git -c protocol.ext.allow=always push agent --tags'
     ;;
 update)
     if [[ $# -ne 1 ]]; then
