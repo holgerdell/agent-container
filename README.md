@@ -32,15 +32,14 @@ The first start upgrades the base system, installs the packages from `install-sy
 ## Usage
 
 ```sh
-agent                         # launch Claude
-agent -- --model MODEL        # pass arguments to Claude
-agent shell                   # open a shell in the VM
-agent shell -- COMMAND ARG... # run a command in the VM
+agent                         # open a shell in the guest copy of the current repo
+agent shell                   # open a shell in the VM (in the guest repo)
+agent shell -- COMMAND ARG... # run a command in the VM (in the guest repo)
 agent update                  # update system packages and user tools
 agent help                    # show wrapper help
 ```
 
-If the configured VM does not exist, launch, shell, and update commands stop with instructions to run `agent init`.
+If the configured VM does not exist, shell and update commands stop with instructions to run `agent init`.
 
 Commands not handled by the wrapper are passed to `limactl` unchanged:
 
@@ -56,14 +55,10 @@ agent start agent-sandbox
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `AGENT_COMMAND` | Coding-agent executable to launch | `claude` |
 | `AGENT_LIMA_INSTANCE` | Lima instance used by the wrapper | `agent-sandbox` |
 | `AGENT_LIMA_DISK_SIZE` | Persistent disk size used by `agent init` | `100GiB` |
 
-When `AGENT_COMMAND` is unset, Claude is launched with `--dangerously-skip-permissions`. A custom executable receives only the arguments supplied after `agent --`.
-
 ```sh
-AGENT_COMMAND=codex agent
 AGENT_LIMA_INSTANCE=my-agent-vm agent shell
 ```
 

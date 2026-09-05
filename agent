@@ -4,12 +4,14 @@ set -euo pipefail
 instance="${AGENT_LIMA_INSTANCE:-agent-sandbox}"
 disk=agent-sandbox-home
 disk_size="${AGENT_LIMA_DISK_SIZE:-100GiB}"
-agent_command="${AGENT_COMMAND:-claude}"
-agent_args=()
-agent_command_hint="${agent_command}"
-if [[ -z ${AGENT_COMMAND+x} ]]; then
-    agent_args=(--dangerously-skip-permissions)
-    agent_command_hint+=" ${agent_args[*]}"
+if [[ -n ${AGENT_COMMAND+x} ]]; then
+    case "${1:-}" in
+    help | -h | --help) ;;
+    *)
+        echo "agent: AGENT_COMMAND was removed; use 'agent shell -- COMMAND...' to run commands in the VM" >&2
+        exit 1
+        ;;
+    esac
 fi
 script_path=${BASH_SOURCE[0]}
 while [[ -L ${script_path} ]]; do
@@ -23,13 +25,12 @@ usage() {
     cat <<'EOF'
 Usage: agent [COMMAND] [ARGS...]
 
-Run a coding agent in the Lima VM.
+Open a shell in the Lima VM, in the guest copy of the current git repository.
 
 Commands:
+  agent                       Open a shell in the guest repo (mirrors host path)
+  agent shell [--] COMMAND... Open a shell or run a command in the VM (in the guest repo)
   agent init                  Create and start the Lima VM
-  agent                       Launch the configured coding agent
-  agent -- ARGS...            Forward arguments to the coding agent
-  agent shell [--] COMMAND... Open a shell or run a command in the VM
   agent git                   Show status of the 'agent' remote (read-only)
   agent update                Update system packages and user tools
   agent help                  Show this help
@@ -37,7 +38,6 @@ Commands:
 Other commands are passed through to limactl.
 
 Environment:
-  AGENT_COMMAND  Coding-agent executable (default: claude)
   AGENT_LIMA_INSTANCE  Lima instance name (default: agent-sandbox)
   AGENT_LIMA_DISK_SIZE  Persistent disk size used by init (default: 100GiB)
 EOF
@@ -62,13 +62,69 @@ require_instance() {
     exit 1
 }
 
-launch_agent() {
-    exec limactl shell "${instance}" -- "${agent_command}" "${agent_args[@]}" "$@"
+open_shell() {
+    local workdir home
+    # shellcheck disable=SC2310 # fallback shells on failure must not exit
+    if workdir=$(guest_workdir); then
+        exec limactl shell --workdir "${workdir}" "${instance}" "$@"
+    elif home=$(resolve_guest_home); then
+        exec limactl shell --workdir "${home}" "${instance}" "$@"
+    else
+        exec limactl shell "${instance}" "$@"
+    fi
+}
+
+resolve_guest_home() {
+    local home
+    # limactl shell passes arguments without a shell, so a literal '~'
+    # would never expand on the guest. Resolve the guest home first.
+    # shellcheck disable=SC2016 # $HOME must expand on the guest, not the host
+    if ! home=$(limactl shell "${instance}" -- sh -c 'printf %s "$HOME"' 2>/dev/null) || [[ -z ${home} ]]; then
+        return 1
+    fi
+    echo "${home}"
+}
+
+guest_workdir() {
+    local repo_root slug host_dir rel guest_home guest_repo guest_dir
+    # shellcheck disable=SC2310 # missing host repo means guest-home fallback, must not exit
+    repo_root=$(find_git_root 2>/dev/null) || return 1
+    slug=$(basename -- "${repo_root}")
+    slug=${slug// /-}
+    host_dir=$(pwd -P)
+    if [[ ${host_dir} == "${repo_root}" ]]; then
+        rel=""
+    else
+        rel=${host_dir#"${repo_root}/"}
+    fi
+    # shellcheck disable=SC2310 # unresolvable guest home means default directory, must not exit
+    if ! guest_home=$(resolve_guest_home) || [[ -z ${guest_home} ]]; then
+        echo "agent: warning: could not resolve guest home; opening shell in default directory" >&2
+        return 1
+    fi
+    guest_repo="${guest_home}/src/${slug}"
+    if ! limactl shell "${instance}" -- git -C "${guest_repo}" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "agent: warning: no repo at ${guest_repo} in '${instance}'; opening shell in guest home" >&2
+        echo "Run 'agent git' to inspect host/guest sync status." >&2
+        echo "${guest_home}"
+        return 0
+    fi
+    if [[ -z ${rel} ]]; then
+        echo "${guest_repo}"
+        return 0
+    fi
+    guest_dir="${guest_repo}/${rel}"
+    if limactl shell "${instance}" -- test -d "${guest_dir}" >/dev/null 2>&1; then
+        echo "${guest_dir}"
+    else
+        echo "agent: warning: '${rel}' does not exist in guest repo; opening shell at repo root" >&2
+        echo "${guest_repo}"
+    fi
 }
 
 find_git_root() {
-    # Worktrees and submodules are rejected: their ".git" entry is a file
-    # pointing elsewhere, not a real repository directory.
+    # Walk up to the outermost repo: a ".git" file (worktree, submodule)
+    # is skipped so the outer repository is used.
     local dir
     dir=$(pwd -P)
     while :; do
@@ -106,13 +162,7 @@ case "${1:-}" in
 "")
     require_limactl
     require_instance
-    launch_agent
-    ;;
---)
-    shift
-    require_limactl
-    require_instance
-    launch_agent "$@"
+    open_shell
     ;;
 init)
     if [[ $# -ne 1 ]]; then
@@ -130,14 +180,14 @@ init)
         limactl start --yes --progress --name="${instance}" "${script_dir}/lima.yaml"
     fi
     printf '\nTry one of these commands:\n'
-    printf '  agent shell  # open a shell in the VM\n'
-    printf '  agent        # launch %s\n' "${agent_command_hint}"
+    printf '  agent        # open a shell in the guest repo\n'
+    printf '  agent shell  # open a shell in the VM (in the guest repo)\n'
     ;;
 shell)
     shift
     require_limactl
     require_instance
-    exec limactl shell "${instance}" "$@"
+    open_shell "$@"
     ;;
 git)
     if [[ $# -ne 1 ]]; then
@@ -250,6 +300,10 @@ update)
     ;;
 help | -h | --help)
     usage
+    ;;
+--)
+    echo "agent: 'agent --' was removed; use 'agent shell -- COMMAND...' to run commands in the VM" >&2
+    exit 2
     ;;
 *)
     require_limactl
