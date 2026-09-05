@@ -206,11 +206,18 @@ git)
         printf '%-12s %s\n' "refs" "diverged (${diverged_count})"
         echo "${diverged}"
     fi
-    printf '\nTo pull everything from guest to host, fetch guest refs then fast-forward the current branch:\n'
+    # The ext:: remote needs protocol.ext.allow; drop the flag once it is configured.
+    ext_allow=$(git -C "${repo_root}" config --get protocol.ext.allow || true)
+    if [[ ${ext_allow} == "always" ]]; then
+        ext_opt=""
+    else
+        ext_opt="-c protocol.ext.allow=always "
+    fi
+    printf '\nTo pull everything from guest to host, fast-forward the current branch:\n'
     # shellcheck disable=SC2016 # command text for the user; must stay literal
-    printf '%s\n' '  git -c protocol.ext.allow=always fetch agent && git merge --ff-only agent/$(git branch --show-current)'
+    printf '  git %s\n' "${ext_opt}"'pull --ff-only agent $(git branch --show-current)'
     printf 'To push everything from host to guest, push all branches and tags:\n'
-    printf '%s\n' '  git -c protocol.ext.allow=always push agent --all && git -c protocol.ext.allow=always push agent --tags'
+    printf '  git %s\n' "${ext_opt}""push agent 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'"
     ;;
 update)
     if [[ $# -ne 1 ]]; then
