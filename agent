@@ -67,17 +67,19 @@ launch_agent() {
 }
 
 summarize_porcelain() {
-    local porcelain=$1 staged unstaged untracked summary
+    local porcelain=$1 staged modified deleted untracked summary
     if [[ -z ${porcelain} ]]; then
         echo "clean"
         return
     fi
     staged=$(grep -c '^[MARCUDT]' <<<"${porcelain}" || true)
-    unstaged=$(grep -c '^.[MDT]' <<<"${porcelain}" || true)
+    modified=$(grep -c '^.[MT]' <<<"${porcelain}" || true)
+    deleted=$(grep -c '^.D' <<<"${porcelain}" || true)
     untracked=$(grep -c '^??' <<<"${porcelain}" || true)
     summary=""
     if ((staged > 0)); then summary+="${staged} staged, "; fi
-    if ((unstaged > 0)); then summary+="${unstaged} unstaged, "; fi
+    if ((modified > 0)); then summary+="${modified} modified, "; fi
+    if ((deleted > 0)); then summary+="${deleted} deleted, "; fi
     if ((untracked > 0)); then summary+="${untracked} untracked, "; fi
     echo "dirty (${summary%, })"
 }
@@ -157,18 +159,12 @@ git)
     host_status=$(git -C "${repo_root}" status --porcelain)
     host_summary=$(summarize_porcelain "${host_status}")
     printf '%-12s %s\n' "host" "${host_summary}"
-    if [[ -n ${host_status} ]]; then
-        echo "  ${host_status//$'\n'/$'\n'  }"
-    fi
     if [[ -z ${guest_repo} ]]; then
         printf '%-12s %s\n' "guest" "unreachable (is the VM running?)"
     elif limactl shell "${instance}" -- git -C "${guest_repo}" rev-parse --git-dir >/dev/null 2>&1; then
         guest_status=$(limactl shell "${instance}" -- git -C "${guest_repo}" status --porcelain)
         guest_summary=$(summarize_porcelain "${guest_status}")
         printf '%-12s %s\n' "guest" "${guest_summary}"
-        if [[ -n ${guest_status} ]]; then
-            echo "  ${guest_status//$'\n'/$'\n'  }"
-        fi
     else
         printf '%-12s %s\n' "guest" "no repo at ${guest_repo}"
     fi
