@@ -3,6 +3,13 @@
 # PATH is handled by the image (ENV PATH, and the generated profile snippet for
 # login shells), not here.
 
+# ---------------------------------------------------------------------------
+# Environment (applies to every shell that reads this file)
+# ---------------------------------------------------------------------------
+
+# Larger PyPy nursery: fewer minor collections for allocation-heavy programs.
+export PYPY_GC_NURSERY=4MB
+
 # Do not apply interactive settings to scripts and `bash -lc` commands.
 [[ $- != *i* ]] && return
 
