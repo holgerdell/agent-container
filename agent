@@ -66,6 +66,24 @@ launch_agent() {
     exec limactl shell "${instance}" -- "${agent_command}" "${agent_args[@]}" "$@"
 }
 
+find_git_root() {
+    # Worktrees and submodules are rejected: their ".git" entry is a file
+    # pointing elsewhere, not a real repository directory.
+    local dir
+    dir=$(pwd -P)
+    while :; do
+        if [[ -d "${dir}/.git" ]]; then
+            echo "${dir}"
+            return 0
+        fi
+        if [[ ${dir} == / ]]; then
+            echo "agent: not inside a git repository" >&2
+            exit 1
+        fi
+        dir=$(dirname -- "${dir}")
+    done
+}
+
 summarize_porcelain() {
     local porcelain=$1 staged modified deleted untracked summary
     if [[ -z ${porcelain} ]]; then
@@ -128,11 +146,7 @@ git)
     fi
     require_limactl
     require_instance
-    repo_root=$("${script_dir}/find-git-root") ||
-        {
-            echo "agent: not inside a git repository" >&2
-            exit 1
-        }
+    repo_root=$(find_git_root)
     slug=$(basename -- "${repo_root}")
     slug=${slug// /-}
     if remote_url=$(git -C "${repo_root}" remote get-url agent 2>/dev/null); then
