@@ -32,7 +32,9 @@ Commands:
   agent shell [--] COMMAND... Open a shell or run a command in the VM (in the guest repo)
   agent init                  Create and start the Lima VM
   agent git                   Show status of the 'agent' remote (read-only)
+  agent install               Copy the guest-root files into the running VM
   agent update                Update system packages and user tools
+  agent sshfs [mount|unmount] Show status or (un)mount the guest home via SSHFS
   agent help                  Show this help
 
 Other commands are passed through to limactl.
@@ -140,6 +142,20 @@ find_git_root() {
     done
 }
 
+install_guest_root() {
+    # Mirrors the data provisions in lima.yaml, for an already-running VM.
+    local files src dest
+    files=$(find "${script_dir}/guest-root" -type f | LC_ALL=C sort)
+    while IFS= read -r src; do
+        [[ -n ${src} ]] || continue
+        dest="/${src#"${script_dir}/guest-root/"}"
+        printf 'installing %s -> %s:%s\n' "${src#"${script_dir}/"}" "${instance}" "${dest}"
+        # shellcheck disable=SC2016 # $1 must expand in the guest shell, not here
+        limactl shell --start "${instance}" -- \
+            sudo sh -c 'cat > "$1" && chmod 644 "$1"' sh "${dest}" <"${src}"
+    done <<<"${files}"
+}
+
 summarize_porcelain() {
     local porcelain=$1 staged modified deleted untracked summary
     if [[ -z ${porcelain} ]]; then
@@ -156,6 +172,140 @@ summarize_porcelain() {
     if ((deleted > 0)); then summary+="${deleted} deleted, "; fi
     if ((untracked > 0)); then summary+="${untracked} untracked, "; fi
     echo "dirty (${summary%, })"
+}
+
+sshfs_mountpoint() {
+    echo "${HOME}/guest"
+}
+
+sshfs_ssh_config() {
+    echo "${LIMA_HOME:-${HOME}/.lima}/${instance}/ssh.config"
+}
+
+sshfs_mounted() {
+    local mountpoint=$1
+    mount | grep -Fq " on ${mountpoint} "
+}
+
+sshfs_setup_instructions() {
+    local os
+    os=$(uname -s)
+    if [[ ${os} == Darwin ]]; then
+        cat <<'EOF'
+Install sshfs (requires macFUSE):
+  brew install --cask sshfs-mac
+EOF
+    else
+        cat <<'EOF'
+Install sshfs with your package manager, e.g.:
+  sudo apt install sshfs
+EOF
+    fi
+    cat <<'EOF'
+Then mount the guest home with:
+  agent sshfs mount
+EOF
+}
+
+sshfs_status() {
+    local mountpoint ssh_config instances sshfs_bin
+    mountpoint=$(sshfs_mountpoint)
+    ssh_config=$(sshfs_ssh_config)
+    sshfs_bin=$(command -v sshfs || true)
+    if [[ -n ${sshfs_bin} ]]; then
+        printf '%-12s %s\n' "sshfs" "${sshfs_bin}"
+    else
+        printf '%-12s %s\n' "sshfs" "not installed"
+    fi
+    printf '%-12s %s\n' "mountpoint" "${mountpoint}"
+    # shellcheck disable=SC2310 # "not mounted" is a normal state, must not exit
+    if sshfs_mounted "${mountpoint}"; then
+        printf '%-12s %s\n' "mounted" "yes"
+    else
+        printf '%-12s %s\n' "mounted" "no"
+    fi
+    if [[ -f ${ssh_config} ]]; then
+        printf '%-12s %s\n' "ssh config" "${ssh_config}"
+    else
+        printf '%-12s %s\n' "ssh config" "missing (${ssh_config})"
+    fi
+    if ! command -v limactl >/dev/null 2>&1; then
+        printf '%-12s %s\n' "instance" "unknown (limactl not found)"
+    else
+        instances=$(limactl list --quiet 2>/dev/null)
+        if grep -Fqx "${instance}" <<<"${instances}"; then
+            printf '%-12s %s\n' "instance" "${instance} (exists)"
+        else
+            printf '%-12s %s\n' "instance" "${instance} (missing; run 'agent init')"
+        fi
+    fi
+    # shellcheck disable=SC2310 # "not mounted" is a normal state, must not exit
+    if [[ -z ${sshfs_bin} ]]; then
+        printf '\n'
+        sshfs_setup_instructions
+    elif ! sshfs_mounted "${mountpoint}"; then
+        printf '\nMount the guest home with:\n  agent sshfs mount\n'
+    fi
+}
+
+sshfs_mount() {
+    local mountpoint ssh_config guest_home vol opts os
+    require_limactl
+    require_instance
+    if ! command -v sshfs >/dev/null 2>&1; then
+        echo "agent: sshfs is not installed" >&2
+        sshfs_setup_instructions
+        exit 1
+    fi
+    mountpoint=$(sshfs_mountpoint)
+    ssh_config=$(sshfs_ssh_config)
+    mkdir -p "${mountpoint}"
+    # shellcheck disable=SC2310 # "not mounted" is a normal state, must not exit
+    if sshfs_mounted "${mountpoint}"; then
+        echo "already mounted: ${mountpoint}"
+        return 0
+    fi
+    if [[ ! -f ${ssh_config} ]]; then
+        echo "agent: no ssh config at ${ssh_config}; start '${instance}' at least once" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2310 # unreachable guest means a clear error, must not exit
+    if ! guest_home=$(resolve_guest_home) || [[ -z ${guest_home} ]]; then
+        echo "agent: could not reach '${instance}'; start it first" >&2
+        exit 1
+    fi
+    vol=${instance//[^[:alnum:]._-]/_}
+    os=$(uname -s)
+    if [[ ${os} == Darwin ]]; then
+        opts="volname=${vol},reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,defer_permissions,noappledouble,auto_cache"
+    else
+        opts="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,auto_cache"
+    fi
+    if sshfs -F "${ssh_config}" "lima-${instance}:${guest_home}" "${mountpoint}" -o "${opts}"; then
+        echo "mounted ${guest_home} at ${mountpoint}"
+        echo "Consider excluding ${mountpoint} from Spotlight to avoid crawling the VM."
+    else
+        echo "agent: sshfs mount failed" >&2
+        exit 1
+    fi
+}
+
+sshfs_unmount() {
+    local mountpoint
+    mountpoint=$(sshfs_mountpoint)
+    # shellcheck disable=SC2310 # "not mounted" is a normal state, must not exit
+    if ! sshfs_mounted "${mountpoint}"; then
+        echo "not mounted: ${mountpoint}"
+        return 0
+    fi
+    if umount "${mountpoint}"; then
+        echo "unmounted ${mountpoint}"
+    elif command -v fusermount >/dev/null 2>&1 && fusermount -u "${mountpoint}"; then
+        echo "unmounted ${mountpoint}"
+    else
+        echo "agent: failed to unmount ${mountpoint}" >&2
+        exit 1
+    fi
 }
 
 case "${1:-}" in
@@ -279,6 +429,15 @@ git)
     printf 'To push everything from host to guest, push all branches and tags:\n'
     printf '  git %s\n' "${ext_opt}""push agent 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'"
     ;;
+install)
+    if [[ $# -ne 1 ]]; then
+        echo "usage: agent install" >&2
+        exit 2
+    fi
+    require_limactl
+    require_instance
+    install_guest_root
+    ;;
 update)
     if [[ $# -ne 1 ]]; then
         echo "usage: agent update" >&2
@@ -297,6 +456,44 @@ update)
         sudo rm -f /var/lib/lima/package-provision-complete
     limactl shell "${instance}" -- sudo bash -s <"${script_dir}/install-system"
     limactl shell "${instance}" -- bash -s <"${script_dir}/install-tools"
+    ;;
+sshfs)
+    case "${2:-}" in
+    "" | status)
+        if [[ $# -ne 1 && $# -ne 2 ]]; then
+            echo "usage: agent sshfs [mount|unmount|status]" >&2
+            exit 2
+        fi
+        require_limactl
+        sshfs_status
+        ;;
+    mount)
+        if [[ $# -ne 2 ]]; then
+            echo "usage: agent sshfs mount" >&2
+            exit 2
+        fi
+        sshfs_mount
+        ;;
+    unmount)
+        if [[ $# -ne 2 ]]; then
+            echo "usage: agent sshfs unmount" >&2
+            exit 2
+        fi
+        sshfs_unmount
+        ;;
+    help | -h | --help)
+        cat <<'EOF'
+Usage: agent sshfs [mount|unmount|status]
+
+Without arguments, show SSHFS status and setup instructions.
+mount mounts the guest home at ~/guest; unmount unmounts it.
+EOF
+        ;;
+    *)
+        echo "usage: agent sshfs [mount|unmount|status]" >&2
+        exit 2
+        ;;
+    esac
     ;;
 help | -h | --help)
     usage

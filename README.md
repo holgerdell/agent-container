@@ -35,6 +35,7 @@ The first start upgrades the base system, installs the packages from `install-sy
 agent                         # open a shell in the guest copy of the current repo
 agent shell                   # open a shell in the VM (in the guest repo)
 agent shell -- COMMAND ARG... # run a command in the VM (in the guest repo)
+agent install                 # copy the guest-root files into the running VM
 agent update                  # update system packages and user tools
 agent help                    # show wrapper help
 ```
@@ -48,6 +49,8 @@ agent list
 agent stop agent-sandbox
 agent start agent-sandbox
 ```
+
+`agent install` copies the files under `guest-root` into the running VM, without recreating it. Use it after editing files such as `guest-root/etc/bash.bashrc`; the change applies to shells started afterwards.
 
 `agent update` upgrades APT packages in the running VM and then updates the user-installed tools. It does not restart the VM. Only one update may run for an instance at a time; another invocation exits immediately.
 
@@ -73,7 +76,7 @@ The persistent disk name and its mount path are fixed in `lima.yaml`. If you ren
 
 User tools include uv, Ruff, ty, typos, Mistral Vibe, Bun, Codex, Typst, Tectonic, Ollama, Claude Code, and OpenCode.
 
-Run `agent update` to apply installer changes to an existing VM. Changes to `lima.yaml` generally apply when a new instance is created; the separately named home disk can be attached again.
+Run `agent update` to apply installer changes to an existing VM, and `agent install` to apply `guest-root` changes. Changes to `lima.yaml` generally apply when a new instance is created; the separately named home disk can be attached again.
 
 ## Development
 
