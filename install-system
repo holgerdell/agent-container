@@ -89,4 +89,25 @@ apt-get install -y -qq --no-install-recommends \
     zstd
 status_done 'System packages are ready'
 
+status_start 'Setting up swapfile'
+swapfile=/swapfile
+if [[ ! -f ${swapfile} ]]; then
+    if ! fallocate -l 8G "${swapfile}" 2>/dev/null; then
+        dd if=/dev/zero of="${swapfile}" bs=1M count=8192 status=none
+    fi
+    chmod 600 "${swapfile}"
+    if ! mkswap "${swapfile}"; then
+        rm -f "${swapfile}"
+        dd if=/dev/zero of="${swapfile}" bs=1M count=8192 status=none
+        chmod 600 "${swapfile}"
+        mkswap "${swapfile}"
+    fi
+fi
+chmod 600 "${swapfile}"
+grep -Fqx '/swapfile none swap sw 0 0' /etc/fstab || printf '%s\n' '/swapfile none swap sw 0 0' >>/etc/fstab
+if ! swapon --show=NAME --noheadings | grep -Fqx "${swapfile}"; then
+    swapon "${swapfile}"
+fi
+status_done 'Swap is ready'
+
 install -D /dev/null "${provision_marker}"

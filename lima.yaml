@@ -1,8 +1,9 @@
 minimumLimaVersion: 2.0.0
 
-# Host has 24GiB / 14 cores. Leave ~4GiB + 2 cores for macOS.
-cpus: 12
-memory: 20GiB
+# Host has 24GiB / 14 cores. Leave ~10GiB + 6 cores for macOS:
+# 20GiB starves the host (compressor + swap thrash) with little guest gain.
+cpus: 8
+memory: 14GiB
 
 base:
   - template:_images/ubuntu-26.04
