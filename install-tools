@@ -171,3 +171,7 @@ else
     curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
 fi
 status_done 'OpenCode is ready'
+
+status_start 'Setting up Herdr'
+curl -fsSL https://herdr.dev/install.sh | sh
+status_done 'Herdr is ready'
