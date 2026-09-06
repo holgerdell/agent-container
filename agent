@@ -384,6 +384,9 @@ git)
     fi
     if [[ ${remote_present} == false ]]; then
         printf '%-12s %s\n' "refs" "unknown (agent remote not set up)"
+        printf '\nTo set up the guest as the agent remote:\n'
+        printf "  git remote add agent 'ext::limactl shell %s -- %%S %s'\n" \
+            "${instance}" "${guest_repo:-/home/hold.guest/src/${slug}}"
         exit 0
     fi
     # ls-remote queries the guest without updating local refs or configs.
