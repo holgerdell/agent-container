@@ -42,6 +42,8 @@ agent help                    # show wrapper help
 
 If the configured VM does not exist, shell and update commands stop with instructions to run `agent init`.
 
+`agent` and `agent shell` forward the host's `TERM` and `TERM_PROGRAM` environment variables using Lima's `--preserve-env`, restricted to these two variables.
+
 Commands not handled by the wrapper are passed to `limactl` unchanged:
 
 ```sh

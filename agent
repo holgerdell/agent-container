@@ -66,13 +66,16 @@ require_instance() {
 
 open_shell() {
     local workdir home
+    # Forward only terminal identity from the host environment.
+    export LIMA_SHELLENV_BLOCK='*'
+    export LIMA_SHELLENV_ALLOW='TERM,TERM_PROGRAM'
     # shellcheck disable=SC2310 # fallback shells on failure must not exit
     if workdir=$(guest_workdir); then
-        exec limactl shell --workdir "${workdir}" "${instance}" "$@"
+        exec limactl shell --preserve-env --workdir "${workdir}" "${instance}" "$@"
     elif home=$(resolve_guest_home); then
-        exec limactl shell --workdir "${home}" "${instance}" "$@"
+        exec limactl shell --preserve-env --workdir "${home}" "${instance}" "$@"
     else
-        exec limactl shell "${instance}" "$@"
+        exec limactl shell --preserve-env "${instance}" "$@"
     fi
 }
 
