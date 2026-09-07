@@ -98,7 +98,7 @@ fi
 status_done 'Bun is ready'
 
 status_start 'Setting up Codex'
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
 status_done 'Codex is ready'
 
 machine=$(uname -m)
