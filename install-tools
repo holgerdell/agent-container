@@ -127,20 +127,6 @@ install_release \
     tectonic
 status_done 'Tectonic is ready'
 
-case "${machine}" in
-aarch64 | arm64) ollama_arch=arm64 ;;
-*) ollama_arch=amd64 ;;
-esac
-
-status_start 'Setting up Ollama'
-ollama_latest=$(github_latest ollama/ollama)
-install_release \
-    ollama \
-    "${ollama_latest}" \
-    "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-${ollama_arch}.tar.zst" \
-    bin/ollama
-status_done 'Ollama is ready'
-
 status_start 'Setting up Claude'
 if command -v claude >/dev/null 2>&1; then
     claude update
