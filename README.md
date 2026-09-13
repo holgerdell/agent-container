@@ -25,7 +25,7 @@ Create and provision the VM:
 agent init
 ```
 
-This creates a 100 GiB persistent disk named `agent-sandbox-home`, creates the `agent-sandbox` VM from `lima.yaml`, and starts it. Set `AGENT_LIMA_DISK_SIZE` before initialization to choose another disk size.
+This creates a 100 GiB persistent disk named `agent-home`, creates the `agent-sandbox` VM from `lima.yaml`, and starts it. Set `AGENT_LIMA_DISK_SIZE` before initialization to choose another disk size.
 
 The first start upgrades the base system, installs the packages from `install-system`, installs the user tools from `install-tools`, and copies the files under `guest-root` into the VM. This can take several minutes.
 

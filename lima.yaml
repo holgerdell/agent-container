@@ -15,7 +15,7 @@ user:
   passwordlessSudo: true
 
 additionalDisks:
-  - name: agent-sandbox-home
+  - name: agent-home
     format: true
     fsType: ext4
 
@@ -42,17 +42,21 @@ provision:
 
       guest_user='{{.User}}'
       guest_home='{{.Home}}'
-      persistent_home=/mnt/lima-agent-sandbox-home/home
-      fstab_entry="${persistent_home} ${guest_home} none bind,x-systemd.requires-mounts-for=/mnt/lima-agent-sandbox-home 0 0"
+      # Lima labels the disk "lima-<name>"; ext4 labels are limited to 16
+      # characters, so the disk name must stay short or Lima reformats it
+      # on every boot.
+      persistent_home=/mnt/lima-agent-home
+      fstab_entry="LABEL=lima-agent-home ${guest_home} ext4 defaults 0 2"
 
-      install -d -o "${guest_user}" -g "${guest_user}" "${persistent_home}"
-      if ! find "${persistent_home}" -mindepth 1 -print -quit | grep -q .; then
+      # Never seed the home onto the root disk.
+      mountpoint -q "${persistent_home}"
+      if ! find "${persistent_home}" -mindepth 1 -not -name lost+found -print -quit | grep -q .; then
         cp -a "${guest_home}/." "${persistent_home}/"
       fi
       chown "${guest_user}:${guest_user}" "${persistent_home}"
 
-      mountpoint -q "${guest_home}" || mount --bind "${persistent_home}" "${guest_home}"
       grep -Fqx "${fstab_entry}" /etc/fstab || printf '%s\n' "${fstab_entry}" >>/etc/fstab
+      mountpoint -q "${guest_home}" || mount "${guest_home}"
 
   - mode: system
     file: install-system

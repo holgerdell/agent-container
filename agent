@@ -2,7 +2,7 @@
 set -euo pipefail
 
 instance="${AGENT_LIMA_INSTANCE:-agent-sandbox}"
-disk=agent-sandbox-home
+disk=agent-home
 disk_size="${AGENT_LIMA_DISK_SIZE:-100GiB}"
 if [[ -n ${AGENT_COMMAND+x} ]]; then
     case "${1:-}" in
