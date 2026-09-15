@@ -35,6 +35,8 @@ Commands:
   agent install               Copy the guest-root files into the running VM
   agent update                Update system packages and user tools
   agent sshfs [mount|unmount] Show status or (un)mount the guest home via SSHFS
+  agent open [PATH]           View a guest file on the host (PDF in Skim, else browser)
+  agent completions bash|fish Print shell completions for agent
   agent help                  Show this help
 
 Other commands are passed through to limactl.
@@ -125,6 +127,170 @@ guest_workdir() {
         echo "agent: warning: '${rel}' does not exist in guest repo; opening shell at repo root" >&2
         echo "${guest_repo}"
     fi
+}
+
+guest_ssh() {
+    # Direct SSH through Lima's control socket: much faster than limactl shell.
+    local ssh_config command
+    ssh_config=$(sshfs_ssh_config)
+    command=$(printf '%q ' "$@")
+    ssh -F "${ssh_config}" "lima-${instance}" -- "${command}"
+}
+
+resolve_guest_path() {
+    local path=$1 home dir
+    # shellcheck disable=SC2310 # unreachable guest means a clear error, must not exit
+    if ! home=$(resolve_guest_home) || [[ -z ${home} ]]; then
+        echo "agent: could not reach '${instance}'; start it first" >&2
+        exit 1
+    fi
+    # The host shell expands '~' before we see it; map it to the guest home.
+    # shellcheck disable=SC2088 # the tilde is resolved against the guest home
+    case ${path} in
+    "" | "~" | "${HOME}") echo "${home}" ;;
+    "~/"*) echo "${home}/${path#"~/"}" ;;
+    "${HOME}/"*) echo "${home}/${path#"${HOME}/"}" ;;
+    /*) echo "${path}" ;;
+    *)
+        # shellcheck disable=SC2310 # no guest repo means guest home, must not exit
+        dir=$(guest_workdir 2>/dev/null) || dir=${home}
+        echo "${dir}/${path}"
+        ;;
+    esac
+}
+
+host_open() {
+    local os
+    os=$(uname -s)
+    if [[ ${os} == Darwin ]]; then
+        open "$@"
+    else
+        xdg-open "$@"
+    fi
+}
+
+server_port=8642
+
+ensure_guest_server() {
+    # Serves the guest home over HTTP; Lima forwards the port to the host.
+    if curl -sf -o /dev/null "http://localhost:${server_port}/"; then
+        return 0
+    fi
+    # setsid -f detaches the server so the SSH session can end.
+    guest_ssh bash -c "cd && setsid -f python3 -m http.server ${server_port} --bind 127.0.0.1 >/dev/null 2>&1 </dev/null"
+    for _ in $(seq 1 100); do
+        if curl -sf -o /dev/null "http://localhost:${server_port}/"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "agent: could not start the file server in '${instance}'" >&2
+    exit 1
+}
+
+open_in_browser() {
+    local guest_path=$1 home
+    home=$(resolve_guest_home)
+    if [[ ${guest_path} != "${home}" && ${guest_path} != "${home}/"* ]]; then
+        echo "agent: ${guest_path} is outside the guest home; only ${home} is served" >&2
+        exit 1
+    fi
+    ensure_guest_server
+    host_open "http://localhost:${server_port}${guest_path#"${home}"}"
+}
+
+open_pdf() {
+    # Poll the guest file and copy it on change; the viewer reloads the local copy.
+    local guest_path=$1 local_path stamp last="" os
+    os=$(uname -s)
+    local_path="${TMPDIR:-/tmp}/agent-open-${instance//[^[:alnum:]._-]/_}${guest_path}"
+    mkdir -p "$(dirname -- "${local_path}")"
+    # shellcheck disable=SC2310 # a missing file means a clear error, must not exit
+    if ! guest_ssh test -f "${guest_path}"; then
+        echo "agent: no such file in '${instance}': ${guest_path}" >&2
+        exit 1
+    fi
+    echo "watching ${guest_path} (Ctrl-C to stop)"
+    while :; do
+        # A missing file mid-rebuild is normal; keep waiting for it.
+        # shellcheck disable=SC2310 # a temporarily missing file must not exit
+        if stamp=$(guest_ssh stat -c '%.Y %s' "${guest_path}" 2>/dev/null) && [[ ${stamp} != "${last}" ]]; then
+            # shellcheck disable=SC2310 # a failed copy is retried on the next poll
+            if guest_ssh cat "${guest_path}" >"${local_path}.part"; then
+                mv "${local_path}.part" "${local_path}"
+                if [[ -z ${last} ]]; then
+                    if [[ ${os} == Darwin ]]; then
+                        open -a Skim "${local_path}" 2>/dev/null || open "${local_path}"
+                    else
+                        xdg-open "${local_path}"
+                    fi
+                fi
+                last=${stamp}
+            fi
+        fi
+        sleep 1
+    done
+}
+
+complete_path() {
+    # Lists guest paths starting with PREFIX, resolved like 'agent open'.
+    local prefix=$1 repo_root slug="" rel=""
+    # shellcheck disable=SC2310 # outside a repo, complete relative to guest home
+    if repo_root=$(find_git_root 2>/dev/null); then
+        slug=$(basename -- "${repo_root}")
+        slug=${slug// /-}
+        rel=$(pwd -P)
+        rel=${rel#"${repo_root}"}
+        rel=${rel#/}
+    fi
+    guest_ssh bash -s -- "${slug}" "${rel}" "${prefix}" <<'EOF'
+slug=$1 rel=$2 prefix=$3
+cd "${HOME}/src/${slug}/${rel}" 2>/dev/null || cd
+case ${prefix} in
+"~") p="${HOME}/" ;;
+"~/"*) p="${HOME}/${prefix#"~/"}" ;;
+*) p=${prefix} ;;
+esac
+for f in "${p}"*; do
+    [[ -e ${f} ]] || continue
+    [[ -d ${f} ]] && f="${f}/"
+    [[ ${prefix} == "~"* ]] && f="~${f#"${HOME}"}"
+    printf '%s\n' "${f}"
+done
+EOF
+}
+
+completions_bash() {
+    cat <<'EOF'
+_agent() {
+    local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[1]:-}
+    if ((COMP_CWORD == 1)); then
+        mapfile -t COMPREPLY < <(compgen -W 'shell init git install update sshfs open completions help' -- "${cur}")
+        return
+    fi
+    case ${cmd} in
+    open)
+        mapfile -t COMPREPLY < <(agent completions path "${cur}" 2>/dev/null)
+        if [[ ${#COMPREPLY[@]} -ne 1 || ${COMPREPLY[0]} == */ ]]; then
+            compopt -o nospace
+        fi
+        ;;
+    sshfs) mapfile -t COMPREPLY < <(compgen -W 'mount unmount status' -- "${cur}") ;;
+    completions) mapfile -t COMPREPLY < <(compgen -W 'bash fish' -- "${cur}") ;;
+    esac
+}
+complete -F _agent agent
+EOF
+}
+
+completions_fish() {
+    cat <<'EOF'
+complete -c agent -f
+complete -c agent -n __fish_use_subcommand -a 'shell init git install update sshfs open completions help'
+complete -c agent -n '__fish_seen_subcommand_from sshfs' -a 'mount unmount status'
+complete -c agent -n '__fish_seen_subcommand_from completions' -a 'bash fish'
+complete -c agent -n '__fish_seen_subcommand_from open' -a '(agent completions path (commandline -ct))'
+EOF
 }
 
 find_git_root() {
@@ -520,6 +686,34 @@ EOF
         ;;
     *)
         echo "usage: agent sshfs [mount|unmount|status]" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+open)
+    if [[ $# -gt 2 ]]; then
+        echo "usage: agent open [PATH]" >&2
+        exit 2
+    fi
+    require_limactl
+    require_instance
+    guest_path=$(resolve_guest_path "${2:-}")
+    case ${guest_path} in
+    *.pdf | *.PDF) open_pdf "${guest_path}" ;;
+    *) open_in_browser "${guest_path}" ;;
+    esac
+    ;;
+completions)
+    case "${2:-}" in
+    bash) completions_bash ;;
+    fish) completions_fish ;;
+    path)
+        require_limactl
+        require_instance
+        complete_path "${3:-}"
+        ;;
+    *)
+        echo "usage: agent completions bash|fish" >&2
         exit 2
         ;;
     esac

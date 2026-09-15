@@ -37,6 +37,8 @@ agent shell                   # open a shell in the VM (in the guest repo)
 agent shell -- COMMAND ARG... # run a command in the VM (in the guest repo)
 agent install                 # copy the guest-root files into the running VM
 agent update                  # update system packages and user tools
+agent open [PATH]             # view a guest file on the host
+agent completions bash|fish   # print shell completions
 agent help                    # show wrapper help
 ```
 
@@ -55,6 +57,20 @@ agent start agent-sandbox
 `agent install` copies the files under `guest-root` into the running VM, without recreating it. Use it after editing files such as `guest-root/etc/bash.bashrc`; the change applies to shells started afterwards.
 
 `agent update` upgrades APT packages in the running VM and then updates the user-installed tools. It does not restart the VM. Only one update may run for an instance at a time; another invocation exits immediately.
+
+## Viewing guest files
+
+`agent open PATH` shows a file from the VM on the host without mounting anything. `~` and relative paths are resolved in the guest: `~/src/paper/out.pdf` is the file in the guest home, and a relative path is taken from the guest copy of the current host directory.
+
+- PDFs are copied to a temporary file on the host and opened in Skim (or the default viewer). `agent open` keeps running, polls the guest file once per second, and updates the copy when it changes, so the viewer reloads in place. Stop it with Ctrl-C.
+- Everything else (HTML files, directories, images, ...) opens in the browser at `http://localhost:8642/…`, served by a small HTTP server that `agent open` starts in the guest on demand. Only the guest home is served.
+
+Guest paths can be tab-completed after installing the shell completions:
+
+```sh
+agent completions fish > ~/.config/fish/completions/agent.fish
+echo 'source <(agent completions bash)' >> ~/.bashrc
+```
 
 ## Configuration
 
