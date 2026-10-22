@@ -3,7 +3,7 @@ set -euo pipefail
 
 instance="${AGENT_LIMA_INSTANCE:-agent-sandbox}"
 disk=agent-home
-disk_size="${AGENT_LIMA_DISK_SIZE:-100GiB}"
+disk_size="${AGENT_LIMA_DISK_SIZE:-120GiB}"
 if [[ -n ${AGENT_COMMAND+x} ]]; then
     case "${1:-}" in
     help | -h | --help) ;;
@@ -43,7 +43,7 @@ Other commands are passed through to limactl.
 
 Environment:
   AGENT_LIMA_INSTANCE  Lima instance name (default: agent-sandbox)
-  AGENT_LIMA_DISK_SIZE  Persistent disk size used by init (default: 100GiB)
+  AGENT_LIMA_DISK_SIZE  Persistent disk size used by init (default: 120GiB)
 EOF
 }
 
