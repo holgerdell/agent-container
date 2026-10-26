@@ -647,9 +647,7 @@ update)
         exit 1
     fi
     trap 'rmdir "${lock_dir}"' EXIT
-    limactl shell --start "${instance}" -- \
-        sudo rm -f /var/lib/lima/package-provision-complete
-    limactl shell "${instance}" -- sudo bash -s <"${script_dir}/install-system"
+    limactl shell --start "${instance}" -- sudo bash -s <"${script_dir}/install-system"
     limactl shell "${instance}" -- bash -s <"${script_dir}/install-tools"
     ;;
 sshfs)

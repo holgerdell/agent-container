@@ -88,6 +88,17 @@ for tool in ruff ty typos mistral-vibe; do
 done
 status_done 'Python tools are ready'
 
+status_start 'Setting up eduVPN'
+# Use Ubuntu's Python so the venv can import the apt-installed GI bindings.
+eduvpn_env="${HOME}/.local/share/eduvpn-venv"
+/usr/bin/python3 -m venv --system-site-packages "${eduvpn_env}"
+"${eduvpn_env}/bin/python" -m pip install --upgrade eduvpn-client
+mkdir -p "${HOME}/.local/bin"
+ln -sfn "${eduvpn_env}/bin/eduvpn-cli" "${HOME}/.local/bin/eduvpn-cli"
+eduvpn_user=$(id -un)
+sudo usermod -aG eduvpn "${eduvpn_user}"
+status_done 'eduVPN is ready (new sessions receive network permissions)'
+
 status_start 'Setting up Bun'
 if command -v bun >/dev/null 2>&1; then
     bun upgrade

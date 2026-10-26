@@ -96,6 +96,20 @@ User tools include uv, Ruff, ty, typos, Mistral Vibe, Bun, Codex, Typst, Tectoni
 
 Run `agent update` to apply installer changes to an existing VM, and `agent install` to apply `guest-root` changes. Changes to `lima.yaml` generally apply when a new instance is created; the separately named home disk can be attached again.
 
+Both installers can be rerun to install missing packages and update existing tools.
+eduVPN is installed through pip in `~/.local/share/eduvpn-venv`, using Ubuntu's
+Python GI bindings, as recommended for ARM64 in the
+[eduVPN installation guide](https://docs.eduvpn.org/client/linux/installation.html).
+The system installer makes NetworkManager manage `eth0`, preserving the existing
+Netplan DHCP/DNS settings, and grants the `eduvpn` group permission to manage
+connections from SSH. Network changes have a timed rollback and backups in
+`/var/lib/agent-network-backup`. The user installer adds the current user to that
+group; open a new guest shell after installation.
+
+Run `agent shell -- eduvpn-cli interactive` to select an institution and log in.
+Browser authentication still needs access to the client's callback inside the VM.
+The VPN carries VM traffic; it does not connect the host automatically.
+
 ## Development
 
 ```sh

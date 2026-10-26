@@ -9,11 +9,6 @@ status_done() {
     printf '\033[1;32m✓ %s\033[0m\n' "$1"
 }
 
-provision_marker=/var/lib/lima/package-provision-complete
-if [[ -e "${provision_marker}" ]]; then
-    exit 0
-fi
-
 export DEBIAN_FRONTEND=noninteractive
 
 status_start 'Updating package index'
@@ -41,6 +36,10 @@ apt-get install -y -qq --no-install-recommends \
     git \
     git-delta \
     gnupg \
+    gir1.2-nm-1.0 \
+    gir1.2-secret-1 \
+    gir1.2-gtk-3.0 \
+    gir1.2-notify-0.7 \
     htop \
     hyperfine \
     jq \
@@ -61,6 +60,8 @@ apt-get install -y -qq --no-install-recommends \
     nano \
     nauty \
     neovim \
+    network-manager \
+    network-manager-openvpn \
     nodejs \
     npm \
     openjdk-25-jdk-headless \
@@ -73,6 +74,8 @@ apt-get install -y -qq --no-install-recommends \
     procps \
     pypy3 \
     python3 \
+    python3-gi \
+    python3-venv \
     python3-mypy \
     python3-pygments \
     ripgrep \
@@ -88,6 +91,79 @@ apt-get install -y -qq --no-install-recommends \
     zip \
     zstd
 status_done 'System packages are ready'
+
+status_start 'Setting up eduVPN networking'
+groupadd -f eduvpn
+install -d -m 755 /etc/polkit-1/rules.d
+cat >/etc/polkit-1/rules.d/49-eduvpn.rules <<'EOF'
+// Allow CLI sessions in the VM to manage VPN connections without a GUI agent.
+polkit.addRule(function(action, subject) {
+    if (subject.isInGroup("eduvpn") &&
+        ["org.freedesktop.NetworkManager.network-control",
+         "org.freedesktop.NetworkManager.settings.modify.own",
+         "org.freedesktop.NetworkManager.settings.modify.system"].indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+systemctl enable --now NetworkManager
+
+# Preserve cloud-init's DHCP/DNS settings, changing only the primary renderer.
+network_config=/etc/netplan/90-agent-networkmanager.yaml
+networkd_config=/etc/systemd/network/09-agent-networkmanager.network
+networkd_candidate=$(mktemp)
+cat >"${networkd_candidate}" <<'EOF'
+[Match]
+Name=eth0
+
+[Link]
+Unmanaged=yes
+EOF
+network_candidate=$(mktemp)
+cat >"${network_candidate}" <<'EOF'
+network:
+  version: 2
+  ethernets:
+    eth0:
+      renderer: NetworkManager
+EOF
+if ! cmp -s "${network_candidate}" "${network_config}" ||
+    ! cmp -s "${networkd_candidate}" "${networkd_config}"; then
+    install -d -m 700 /var/lib/agent-network-backup
+    backup_timestamp=$(date +%s)
+    cp -a /etc/netplan "/var/lib/agent-network-backup/netplan-${backup_timestamp}"
+    rollback=/var/lib/agent-network-backup/rollback.sh
+    if [[ -f ${network_config} ]]; then
+        cp -a "${network_config}" /var/lib/agent-network-backup/previous.yaml
+        printf '%s\n' '#!/bin/sh' \
+            'cp /var/lib/agent-network-backup/previous.yaml /etc/netplan/90-agent-networkmanager.yaml' >"${rollback}"
+    else
+        printf '%s\n' '#!/bin/sh' \
+            'rm -f /etc/netplan/90-agent-networkmanager.yaml' >"${rollback}"
+    fi
+    if [[ -f ${networkd_config} ]]; then
+        cp -a "${networkd_config}" /var/lib/agent-network-backup/previous.network
+        printf '%s\n' 'cp /var/lib/agent-network-backup/previous.network /etc/systemd/network/09-agent-networkmanager.network' >>"${rollback}"
+    else
+        printf '%s\n' 'rm -f /etc/systemd/network/09-agent-networkmanager.network' >>"${rollback}"
+    fi
+    printf '%s\n' 'netplan apply' 'networkctl reload' >>"${rollback}"
+    chmod 700 "${rollback}"
+    systemd-run --unit=agent-network-rollback --on-active=120s /bin/sh "${rollback}"
+    install -m 600 "${network_candidate}" "${network_config}"
+    # Prevent dracut's catch-all networkd profile from also starting DHCP.
+    install -D -m 644 "${networkd_candidate}" "${networkd_config}"
+    netplan generate
+    netplan apply
+    networkctl reload
+    # Leave the rollback armed if either routing or DNS/HTTPS is broken.
+    nm-online --quiet --timeout=30
+    curl --fail --silent --show-error --retry 3 --max-time 15 \
+        https://pypi.org/simple/eduvpn-client/ >/dev/null
+    systemctl stop agent-network-rollback.timer
+fi
+rm -f "${network_candidate}" "${networkd_candidate}"
+status_done 'eduVPN networking is ready'
 
 status_start 'Setting up swapfile'
 swapfile=/swapfile
@@ -109,5 +185,3 @@ if ! swapon --show=NAME --noheadings | grep -Fqx "${swapfile}"; then
     swapon "${swapfile}"
 fi
 status_done 'Swap is ready'
-
-install -D /dev/null "${provision_marker}"
