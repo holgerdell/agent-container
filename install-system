@@ -162,6 +162,11 @@ if ! cmp -s "${network_candidate}" "${network_config}" ||
         https://pypi.org/simple/eduvpn-client/ >/dev/null
     systemctl stop agent-network-rollback.timer
 fi
+# eth0 is now managed by NetworkManager. Waiting for networkd would delay
+# network-online.target and SSH logins until its 120-second timeout expires.
+# Run this even when the renderer configuration was already installed.
+systemctl enable --now NetworkManager-wait-online.service
+systemctl disable --now systemd-networkd-wait-online.service
 rm -f "${network_candidate}" "${networkd_candidate}"
 status_done 'eduVPN networking is ready'
 
