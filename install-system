@@ -25,6 +25,7 @@ apt-get install -y -qq --no-install-recommends \
     build-essential \
     bzip2 \
     ca-certificates \
+    cargo \
     clang \
     curl \
     elan \
