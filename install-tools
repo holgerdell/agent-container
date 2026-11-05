@@ -73,6 +73,87 @@ install_release() {
     rm -rf "${work}"
 }
 
+# Run in a subshell so temporary downloads are removed on any failure.
+update_vscode_server() (
+    local root=$1 quality=$2 label=$3
+    local entry installed=0 modern=0 arch work commit target server
+    for entry in "${root}"/bin/*/bin/code-server; do
+        [[ -x ${entry} ]] && installed=1
+    done
+    for entry in "${root}/cli/servers/${label}-"*/server/bin/code-server; do
+        if [[ -x ${entry} ]]; then
+            installed=1
+            modern=1
+        fi
+    done
+    ((installed)) || return 0
+
+    status_start "Updating VS Code Server (${quality}) and extensions"
+    arch=$(uname -m)
+    case ${arch} in
+    x86_64) arch=x64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    armv7l) arch=armhf ;;
+    *)
+        echo "Unsupported VS Code Server architecture: ${arch}" >&2
+        return 1
+        ;;
+    esac
+    work=$(mktemp -d "${root}/.agent-update.XXXXXX")
+    trap 'rm -rf -- "${work}"' EXIT
+    curl -fsSL "https://update.code.visualstudio.com/latest/server-linux-${arch}/${quality}" \
+        -o "${work}/server.tar.gz"
+    mkdir "${work}/server"
+    tar -xzf "${work}/server.tar.gz" -C "${work}/server" --strip-components=1
+    commit=$(jq -er '.commit' "${work}/server/product.json")
+    if [[ ! ${commit} =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Invalid VS Code Server commit: ${commit}" >&2
+        return 1
+    fi
+    "${work}/server/bin/code-server" --version
+
+    if ((modern)); then
+        target="${root}/cli/servers/${label}-${commit}"
+        server="${target}/server"
+    else
+        target="${root}/bin/${commit}"
+        server=${target}
+    fi
+    if [[ ! -x ${server}/bin/code-server ]]; then
+        # Move only a complete, validated download into the installed layout.
+        if ((modern)); then
+            mkdir -p "${target}"
+        else
+            mkdir -p "${root}/bin"
+        fi
+        if [[ -e ${server} ]]; then
+            echo "Incomplete VS Code Server installation at ${server}; remove it and retry" >&2
+            return 1
+        fi
+        mv "${work}/server" "${server}"
+    fi
+    # Invoke the standalone server CLI, independent of any active remote session.
+    VSCODE_AGENT_FOLDER="${root}" "${server}/bin/code-server" \
+        --extensions-dir "${root}/extensions" --update-extensions
+
+    # Restrict cleanup to versioned server directories; preserve settings,
+    # extensions, and the Remote-SSH CLI launchers managed by the client.
+    for entry in "${root}"/bin/*; do
+        [[ -d ${entry} && ${entry} != "${target}" ]] || continue
+        [[ ${entry##*/} =~ ^[0-9a-f]{40}$ ]] || continue
+        rm -rf -- "${entry}"
+    done
+    for entry in "${root}/cli/servers/${label}-"*; do
+        [[ -d ${entry} && ${entry} != "${target}" ]] || continue
+        [[ ${entry##*/} =~ ^${label}-[0-9a-f]{40}$ ]] || continue
+        rm -rf -- "${entry}"
+    done
+    status_done "VS Code Server (${quality}) and extensions are updated"
+)
+
+update_vscode_server "${HOME}/.vscode-server" stable Stable
+update_vscode_server "${HOME}/.vscode-server-insiders" insider Insiders
+
 status_start 'Setting up uv'
 if command -v uv >/dev/null 2>&1; then
     uv self update
