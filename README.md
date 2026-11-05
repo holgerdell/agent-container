@@ -56,7 +56,7 @@ agent start agent-sandbox
 
 `agent install` copies the files under `guest-root` into the running VM, without recreating it. Use it after editing files such as `guest-root/etc/bash.bashrc`; the change applies to shells started afterwards.
 
-`agent update` upgrades APT packages in the running VM and then updates the user-installed tools. If VS Code Server is installed, it also updates the server and all installed remote extensions (Stable and Insiders, including legacy server layouts), then deletes old server versions after a successful update. Settings and extensions are preserved. Reconnect VS Code to use the updated server; the local VS Code client must also be up to date to use the latest server. It does not restart the VM. Only one update may run for an instance at a time; another invocation exits immediately.
+`agent update` upgrades APT packages in the running VM and then updates the user-installed tools. If VS Code Server is installed, it also updates the server and all installed remote extensions (Stable, including legacy server layouts), then deletes old server versions after a successful update. Settings and extensions are preserved. Reconnect VS Code to use the updated server; the local VS Code client must also be up to date to use the latest server. It does not restart the VM. Only one update may run for an instance at a time; another invocation exits immediately.
 
 ## Viewing guest files
 

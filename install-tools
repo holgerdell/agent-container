@@ -75,12 +75,12 @@ install_release() {
 
 # Run in a subshell so temporary downloads are removed on any failure.
 update_vscode_server() (
-    local root=$1 quality=$2 label=$3
+    local root="${HOME}/.vscode-server"
     local entry installed=0 modern=0 arch work commit target server
     for entry in "${root}"/bin/*/bin/code-server; do
         [[ -x ${entry} ]] && installed=1
     done
-    for entry in "${root}/cli/servers/${label}-"*/server/bin/code-server; do
+    for entry in "${root}/cli/servers/Stable-"*/server/bin/code-server; do
         if [[ -x ${entry} ]]; then
             installed=1
             modern=1
@@ -88,7 +88,7 @@ update_vscode_server() (
     done
     ((installed)) || return 0
 
-    status_start "Updating VS Code Server (${quality}) and extensions"
+    status_start "Updating VS Code Server (Stable) and extensions"
     arch=$(uname -m)
     case ${arch} in
     x86_64) arch=x64 ;;
@@ -101,7 +101,7 @@ update_vscode_server() (
     esac
     work=$(mktemp -d "${root}/.agent-update.XXXXXX")
     trap 'rm -rf -- "${work}"' EXIT
-    curl -fsSL "https://update.code.visualstudio.com/latest/server-linux-${arch}/${quality}" \
+    curl -fsSL "https://update.code.visualstudio.com/latest/server-linux-${arch}/stable" \
         -o "${work}/server.tar.gz"
     mkdir "${work}/server"
     tar -xzf "${work}/server.tar.gz" -C "${work}/server" --strip-components=1
@@ -113,7 +113,7 @@ update_vscode_server() (
     "${work}/server/bin/code-server" --version
 
     if ((modern)); then
-        target="${root}/cli/servers/${label}-${commit}"
+        target="${root}/cli/servers/Stable-${commit}"
         server="${target}/server"
     else
         target="${root}/bin/${commit}"
@@ -143,16 +143,15 @@ update_vscode_server() (
         [[ ${entry##*/} =~ ^[0-9a-f]{40}$ ]] || continue
         rm -rf -- "${entry}"
     done
-    for entry in "${root}/cli/servers/${label}-"*; do
+    for entry in "${root}/cli/servers/Stable-"*; do
         [[ -d ${entry} && ${entry} != "${target}" ]] || continue
-        [[ ${entry##*/} =~ ^${label}-[0-9a-f]{40}$ ]] || continue
+        [[ ${entry##*/} =~ ^Stable-[0-9a-f]{40}$ ]] || continue
         rm -rf -- "${entry}"
     done
-    status_done "VS Code Server (${quality}) and extensions are updated"
+    status_done "VS Code Server (Stable) and extensions are updated"
 )
 
-update_vscode_server "${HOME}/.vscode-server" stable Stable
-update_vscode_server "${HOME}/.vscode-server-insiders" insider Insiders
+update_vscode_server
 
 status_start 'Setting up uv'
 if command -v uv >/dev/null 2>&1; then
