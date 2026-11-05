@@ -164,7 +164,7 @@ fi
 status_done 'uv is ready'
 
 status_start 'Setting up Python tools'
-for tool in ruff ty typos mistral-vibe; do
+for tool in ruff ty typos mistral-vibe aristotlelib; do
     uv tool install --upgrade "${tool}"
 done
 status_done 'Python tools are ready'
