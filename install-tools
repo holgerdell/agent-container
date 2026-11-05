@@ -76,7 +76,7 @@ install_release() {
 # Run in a subshell so temporary downloads are removed on any failure.
 update_vscode_server() (
     local root="${HOME}/.vscode-server"
-    local entry installed=0 modern=0 arch work commit target server
+    local entry installed=0 modern=0 arch work commit downloaded_commit target server
     for entry in "${root}"/bin/*/bin/code-server; do
         [[ -x ${entry} ]] && installed=1
     done
@@ -99,18 +99,13 @@ update_vscode_server() (
         return 1
         ;;
     esac
-    work=$(mktemp -d "${root}/.agent-update.XXXXXX")
-    trap 'rm -rf -- "${work}"' EXIT
-    curl -fsSL "https://update.code.visualstudio.com/latest/server-linux-${arch}/stable" \
-        -o "${work}/server.tar.gz"
-    mkdir "${work}/server"
-    tar -xzf "${work}/server.tar.gz" -C "${work}/server" --strip-components=1
-    commit=$(jq -er '.commit' "${work}/server/product.json")
+    # The update API returns the latest commit without downloading the archive.
+    commit=$(curl -fsSL "https://update.code.visualstudio.com/api/update/server-linux-${arch}/stable/latest" |
+        jq -er '.version')
     if [[ ! ${commit} =~ ^[0-9a-f]{40}$ ]]; then
         echo "Invalid VS Code Server commit: ${commit}" >&2
         return 1
     fi
-    "${work}/server/bin/code-server" --version
 
     if ((modern)); then
         target="${root}/cli/servers/Stable-${commit}"
@@ -120,6 +115,19 @@ update_vscode_server() (
         server=${target}
     fi
     if [[ ! -x ${server}/bin/code-server ]]; then
+        work=$(mktemp -d "${root}/.agent-update.XXXXXX")
+        trap 'rm -rf -- "${work}"' EXIT
+        # Pin the download to the commit checked above in case latest changes.
+        curl -fsSL "https://update.code.visualstudio.com/commit:${commit}/server-linux-${arch}/stable" \
+            -o "${work}/server.tar.gz"
+        mkdir "${work}/server"
+        tar -xzf "${work}/server.tar.gz" -C "${work}/server" --strip-components=1
+        downloaded_commit=$(jq -er '.commit' "${work}/server/product.json")
+        if [[ ${downloaded_commit} != "${commit}" ]]; then
+            echo "Downloaded VS Code Server does not match commit ${commit}" >&2
+            return 1
+        fi
+        "${work}/server/bin/code-server" --version
         # Move only a complete, validated download into the installed layout.
         if ((modern)); then
             mkdir -p "${target}"
